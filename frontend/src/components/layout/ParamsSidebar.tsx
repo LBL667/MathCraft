@@ -9,7 +9,7 @@ import Dropdown from '../ui/Dropdown'
 const PANEL_MIN_WIDTH = 220
 const PANEL_MAX_WIDTH = 300
 
-/** 右侧「题目参数」面板：仅出现在智能生成标签页，可向右折叠，左缘可拖拽调宽 */
+/** 右侧「快速出题」面板：仅出现在智能生成标签页，可向右折叠，左缘可拖拽调宽 */
 export default function ParamsSidebar() {
   const {
     paramsCollapsed,
@@ -24,7 +24,10 @@ export default function ParamsSidebar() {
     setTypeConfig,
     difficulty,
     setDifficulty,
+    knowledgeScope,
+    setKnowledgeScope,
     generating,
+    genProgress,
     generate,
   } = useApp()
 
@@ -73,7 +76,7 @@ export default function ParamsSidebar() {
           onClick={toggleParams}
           className="flex-1 cursor-pointer text-sm font-semibold tracking-[0.3em] text-ink-2 [writing-mode:vertical-rl] transition-colors hover:text-primary"
         >
-          题目参数
+          快速出题
         </button>
       </aside>
     )
@@ -96,7 +99,7 @@ export default function ParamsSidebar() {
       <div className="flex items-center justify-between border-b border-line px-5 py-4">
         <div className="flex items-center gap-2 text-[17px] font-bold text-ink">
           <FileText size={18} className="text-primary" />
-          题目参数
+          快速出题
         </div>
         <button
           type="button"
@@ -108,14 +111,17 @@ export default function ParamsSidebar() {
       </div>
 
       <div className="flex-1 space-y-5 overflow-y-auto px-5 py-4">
-        {/* 1. 选择知识库文档：先选知识库，再选其中一份文档 */}
+        {/* 1. 选择题库文档：知识库与题库管理联动，先选题库，再选其中一份文档 */}
         <section>
-          <h3 className="mb-2.5 text-sm font-bold text-ink">1. 选择知识库文档</h3>
+          <h3 className="mb-2.5 text-sm font-bold text-ink">1. 选择题库文档</h3>
+          {/* 选项与题库管理联动（我创建的 + 我加入的），支持搜索与滚动 */}
           <Dropdown
             value={selectedKbId}
             options={kbs.map((k) => ({ value: k.id, label: k.name }))}
             onChange={(v) => selectKb(v)}
-            placeholder="请选择知识库"
+            placeholder="未选择"
+            searchable
+            emptyText="没有匹配的题库"
           />
           <ul className="mt-2 space-y-1.5">
             {docs.map((d) => {
@@ -140,13 +146,25 @@ export default function ParamsSidebar() {
                 </li>
               )
             })}
-            {!docs.length && <li className="py-3 text-center text-xs text-ink-3">该知识库暂无文档</li>}
+            {!docs.length && <li className="py-3 text-center text-xs text-ink-3">该题库暂无文档，可在题库管理中上传</li>}
           </ul>
         </section>
 
-        {/* 2. 选择题型和题数：每个题型带数量输入框 */}
+        {/* 2. 描述知识点或者章节范围 */}
         <section>
-          <h3 className="mb-2.5 text-sm font-bold text-ink">2. 选择题型和题数</h3>
+          <h3 className="mb-2.5 text-sm font-bold text-ink">2. 描述知识点或者章节范围</h3>
+          <input
+            type="text"
+            value={knowledgeScope}
+            onChange={(e) => setKnowledgeScope(e.target.value)}
+            placeholder="如：导数的定义与求导法则"
+            className="block w-full rounded-lg border border-line bg-white px-3 py-2.5 text-sm text-ink outline-none transition-colors placeholder:text-ink-3 focus:border-primary"
+          />
+        </section>
+
+        {/* 3. 选择题型和题数：每个题型带数量输入框 */}
+        <section>
+          <h3 className="mb-2.5 text-sm font-bold text-ink">3. 选择题型和题数</h3>
           <div className="divide-y divide-line/70 rounded-lg border border-line px-3">
             {TYPE_ORDER.map((t) => {
               const cfg = typeConfigs[t]
@@ -177,9 +195,9 @@ export default function ParamsSidebar() {
           </div>
         </section>
 
-        {/* 3. 选择题目难度 */}
+        {/* 4. 选择题目难度 */}
         <section>
-          <h3 className="mb-2.5 text-sm font-bold text-ink">3. 选择题目难度</h3>
+          <h3 className="mb-2.5 text-sm font-bold text-ink">4. 选择题目难度</h3>
           <div className="grid grid-cols-4 gap-2">
             {DIFFICULTIES.map((d) => (
               <button
@@ -199,7 +217,7 @@ export default function ParamsSidebar() {
         </section>
       </div>
 
-      {/* 生成按钮 */}
+      {/* 生成按钮 + 真实进度 */}
       <div className="border-t border-line px-5 py-4">
         <button
           type="button"
@@ -208,8 +226,19 @@ export default function ParamsSidebar() {
           className="flex w-full items-center justify-center gap-2 rounded-lg bg-primary py-3 text-[16px] font-semibold text-white shadow-[0_4px_14px_rgba(30,111,255,0.35)] transition-all hover:bg-[#1a5fe6] active:scale-[0.98] disabled:opacity-60"
         >
           {generating ? <Loader2 size={17} className="animate-spin" /> : <Sparkles size={17} />}
-          {generating ? '生成中…' : '生成题目'}
+          {generating ? `生成中 ${genProgress?.percent ?? 0}%` : '生成题目'}
         </button>
+        {generating && (
+          <div className="mt-2.5">
+            <div className="h-1.5 w-full overflow-hidden rounded-full bg-primary-light">
+              <div
+                className="h-full rounded-full bg-primary transition-[width] duration-300 ease-out"
+                style={{ width: `${genProgress?.percent ?? 0}%` }}
+              />
+            </div>
+            <p className="mt-1.5 text-center text-xs text-ink-3">{genProgress?.stage ?? '准备生成'}</p>
+          </div>
+        )}
       </div>
     </aside>
   )
