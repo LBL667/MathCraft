@@ -1,4 +1,5 @@
 import { AppProvider, useApp } from './store/AppContext'
+import { AuthProvider, useAuth } from './store/AuthContext'
 import TopBar from './components/layout/TopBar'
 import SideNav from './components/layout/SideNav'
 import ParamsSidebar from './components/layout/ParamsSidebar'
@@ -11,11 +12,12 @@ import FavoritesTab from './components/tabs/FavoritesTab'
 import SpaceTab from './components/tabs/SpaceTab'
 import ProfileTab from './components/tabs/ProfileTab'
 import Toast from './components/ui/Toast'
+import LoginPage from './components/auth/LoginPage'
 
 function Shell() {
   const { activeTab } = useApp()
   return (
-    <div className="flex h-screen flex-col bg-page text-ink">
+    <div className="flex h-screen animate-fade-in flex-col bg-page text-ink">
       <TopBar />
       <div className="relative flex min-h-0 flex-1">
         <SideNav />
@@ -54,10 +56,21 @@ function Shell() {
   )
 }
 
-export default function App() {
+/** 登录门禁：未登录渲染登录页（登录成功整页淡出），已登录挂载主应用并淡入 */
+function AuthGate() {
+  const { user } = useAuth()
+  if (!user) return <LoginPage />
   return (
     <AppProvider>
       <Shell />
     </AppProvider>
+  )
+}
+
+export default function App() {
+  return (
+    <AuthProvider>
+      <AuthGate />
+    </AuthProvider>
   )
 }

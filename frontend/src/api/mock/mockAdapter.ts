@@ -125,7 +125,12 @@ export const mockAdapter: ApiClient = {
       spaces: spaceNames,
       published: payload.published !== false,
       questions: payload.questions ?? [],
+      modulesOrder: payload.modulesOrder,
       examWindow: payload.examWindow ?? null,
+      // 学生作答状态：新发布默认未作答
+      answered: false,
+      // 演示：已提交作答人数（3~19 人，保证讲解视图分布有数据可展示）
+      submittedCount: payload.published === false ? 0 : Math.floor(Math.random() * 17) + 3,
       // 发布时未勾选保存则不进组卷记录页，但记录必须存在，学习空间页据此展示试卷
       savedToRecords: payload.published === false ? true : payload.saveRecord,
     }

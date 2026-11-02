@@ -16,8 +16,10 @@ import type {
   StudySpace,
   TeacherProfile,
 } from '../types'
-import { CURRENT_USER } from '../constants'
 import defaultAvatar from '../assets/teacher_avatar.png'
+import { orderQuestionsByModules } from '../lib/order'
+import { useAuth } from './AuthContext'
+import type { AuthRole, AuthUser } from '../api/auth'
 
 export type TabKey = 'generate' | 'preview' | 'bank' | 'records' | 'fav' | 'space' | 'me'
 
@@ -109,11 +111,20 @@ interface AppState {
   deleteRecord: (id: string) => Promise<void>
   deleteRecordQuestions: (recordId: string, ids: string[]) => void
   publishRecords: (ids: string[]) => void
+  /** 当前登录角色；null 表示未登录（理论上主应用仅在登录后挂载） */
+  role: AuthRole | null
   createSpace: (name: string, capacity: number) => StudySpace
   updateRecord: (record: AssembleRecord) => void
+  /** 按空间编号加入空间（学生演示流程），成功返回空间，编号不存在返回 null */
+  joinSpaceByCode: (code: string) => StudySpace | null
+  /** 学生退出空间：从空间列表移除 */
+  leaveSpace: (id: string) => void
+  /** 教师解散空间：空间整体移除（演示态），关联的组卷记录保留 */
   dissolveSpace: (id: string) => void
   removeSpaceMember: (spaceId: string, name: string) => void
   renameSpace: (spaceId: string, newName: string) => void
+  /** 学生交卷后标记作答状态（重新作答时置回 false） */
+  markRecordAnswered: (recordId: string, answered: boolean) => void
   openPaperId: string | null
   requestOpenPaper: (recordId: string) => void
   clearOpenPaper: () => void
@@ -132,7 +143,39 @@ interface AppState {
 
 const AppContext = createContext<AppState | null>(null)
 
+/** 按登录身份生成教师资料：学生用姓氏头像（avatar 留空），教师沿用默认头像 */
+function buildProfile(user: AuthUser | null): TeacherProfile {
+  if (user?.role === 'student') {
+    return {
+      name: user.displayName,
+      avatar: '',
+      gender: '男',
+      phone: '13800138000',
+      email: 'xiaoming@stu.edu.cn',
+      teacherId: 'ST20250001',
+      school: '广东金融学院',
+      identity: user.identity,
+    }
+  }
+  return {
+    name: user?.displayName ?? '张老师',
+    avatar: defaultAvatar,
+    gender: '男',
+    phone: '13800138000',
+    email: 'zhang@163.com',
+    teacherId: 'TK20240001',
+    school: '广东金融学院',
+    identity: user?.identity ?? '教师',
+  }
+}
+
+/** AppProvider 挂载在 AuthProvider 内，登录态已就绪 */
+function useAuthUser(): AuthUser | null {
+  return useAuth().user
+}
+
 export function AppProvider({ children }: { children: ReactNode }) {
+  const user = useAuthUser()
   const [activeTab, setActiveTab] = useState<TabKey>('generate')
   const [navCollapsed, setNavCollapsed] = useState(false)
   const [paramsCollapsed, setParamsCollapsed] = useState(false)
@@ -153,16 +196,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [favorites, setFavorites] = useState<Question[]>([])
   // 收藏分组：default 组固定存在，其余由用户在收藏页新建
   const [favGroups, setFavGroups] = useState<FavoriteGroup[]>([{ id: 'default', name: '默认' }])
-  const [profile, setProfile] = useState<TeacherProfile>({
-    name: CURRENT_USER,
-    avatar: defaultAvatar,
-    gender: '男',
-    phone: '13800138000',
-    email: 'zhang@163.com',
-    teacherId: 'TK20240001',
-    school: '广东金融学院',
-    identity: '教师',
-  })
+  const [profile, setProfile] = useState<TeacherProfile>(() => buildProfile(useAuthUser()))
   const [selectedIds, setSelectedIds] = useState<string[]>([])
   const [typeFilter, setTypeFilter] = useState<QuestionType | 'all'>('all')
   const [diffFilter, setDiffFilter] = useState<Difficulty | 'all'>('all')
@@ -430,6 +464,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
       }
       const record = await api.publishPaper({
         modules,
+        // 记住组卷时调整后的题型模块顺序，讲解视图按此分区
+        modulesOrder: modules,
         spaceIds,
         // 新建空间不在适配器静态演示表内，空间名称由前端解析后随载荷传入
         spaceNames: spaceIds
@@ -438,7 +474,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
         saveRecord,
         name,
         published,
-        questions,
+        // 按调整后的模块顺序重排题目，题号与讲解/作答视图分区保持一致
+        questions: orderQuestionsByModules(questions, modules),
         examWindow,
       })
       if (record) setRecords((prev) => [record, ...prev])
@@ -448,7 +485,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
           ? saveRecord
             ? '组卷已发布，并保存到组卷记录'
             : '组卷已发布到所选学习空间'
-          : `试卷「${name ?? '未命名'}」已暂存为草稿`,
+          : `试卷「${name ?? '未命名'}」已保存到组卷记录`,
       )
       return true
     },
@@ -503,7 +540,35 @@ export function AppProvider({ children }: { children: ReactNode }) {
     [],
   )
 
-  /** 解散学习空间（关联的组卷记录保留） */
+  /** 按编号加入空间：成员数与成员名单同步更新 */
+  const joinSpaceByCode = useCallback(
+    (code: string) => {
+      const found = spaces.find((s) => s.code.toUpperCase() === code.trim().toUpperCase())
+      if (!found) return null
+      const displayName = profile.name
+      setSpaces((prev) =>
+        prev.map((s) =>
+          s.id === found.id && !s.members.includes(displayName)
+            ? { ...s, members: [...s.members, displayName], memberCount: Math.min(s.capacity, s.memberCount + 1) }
+            : s,
+        ),
+      )
+      showToast(`已加入学习空间「${found.name}」`)
+      return found
+    },
+    [spaces, profile.name, showToast],
+  )
+
+  /** 学生退出空间：从列表移除，关联的组卷记录保留 */
+  const leaveSpace = useCallback(
+    (id: string) => {
+      setSpaces((prev) => prev.filter((s) => s.id !== id))
+      showToast('已退出学习空间')
+    },
+    [showToast],
+  )
+
+  /** 教师解散空间：空间整体移除，成员全部移出（演示态） */
   const dissolveSpace = useCallback(
     (id: string) => {
       setSpaces((prev) => prev.filter((s) => s.id !== id))
@@ -534,6 +599,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
     })
   }, [])
 
+  /** 学生交卷 / 重新作答：同步更新组卷记录的作答状态 */
+  const markRecordAnswered = useCallback((recordId: string, answered: boolean) => {
+    setRecords((prev) => prev.map((r) => (r.id === recordId ? { ...r, answered } : r)))
+  }, [])
+
   /** 跨页联动：请求打开某份试卷的查看标签（组卷记录页消费） */
   const [openPaperId, setOpenPaperId] = useState<string | null>(null)
   const requestOpenPaper = useCallback((recordId: string) => setOpenPaperId(recordId), [])
@@ -549,14 +619,14 @@ export function AppProvider({ children }: { children: ReactNode }) {
         code,
         memberCount: 1,
         capacity,
-        creator: CURRENT_USER,
-        members: [CURRENT_USER],
+        creator: profile.name,
+        members: [profile.name],
       }
       setSpaces((prev) => [...prev, space])
       showToast(`学习空间「${name}」创建成功`)
       return space
     },
-    [showToast],
+    [profile.name, showToast],
   )
 
   /** 一键清空：题目、对话记录与对话记忆全部重置 */
@@ -668,11 +738,15 @@ export function AppProvider({ children }: { children: ReactNode }) {
     deleteRecord,
     deleteRecordQuestions,
     publishRecords,
+    role: user?.role ?? null,
     createSpace,
     updateRecord,
+    joinSpaceByCode,
+    leaveSpace,
     dissolveSpace,
     removeSpaceMember,
     renameSpace,
+    markRecordAnswered,
     openPaperId,
     requestOpenPaper,
     clearOpenPaper,

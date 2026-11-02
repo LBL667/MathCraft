@@ -88,11 +88,17 @@ export default function ProfileTab() {
           onClick={() => fileInput.current?.click()}
           title="点击更换头像"
         >
-          <img
-            src={profile.avatar}
-            alt="教师头像"
-            className="h-[96px] w-[96px] rounded-2xl border border-line/60 object-cover"
-          />
+          {profile.avatar ? (
+            <img
+              src={profile.avatar}
+              alt={`${profile.identity}头像`}
+              className="h-[96px] w-[96px] rounded-full border border-line/60 object-cover"
+            />
+          ) : (
+            <span className="flex h-[96px] w-[96px] items-center justify-center rounded-full border border-line/60 bg-primary-light text-3xl font-semibold text-primary">
+              {profile.name.charAt(0)}
+            </span>
+          )}
           <BadgeCheck
             size={22}
             className="absolute -bottom-1 right-0 rounded-full bg-white text-primary"

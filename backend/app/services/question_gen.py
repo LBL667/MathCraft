@@ -99,10 +99,9 @@ def _gen_for_type(
     scope: str | None,
     avoid_norm: set[str],
     mixed_difficulty: bool,
-    progress_cb: ProgressCB | None = None,
-    base_progress: int = 0,
-    span_progress: int = 100,
+    report: Callable[[float, str], None] | None = None,
 ) -> list[Question]:
+    """生成单个题型的题目。report(frac, stage) 上报该 agent 的内部完成度（0~1）与阶段文案。"""
     type_label = TYPE_LABELS[tc.type]
 
     # original 模式：先确认材料原题数量是否足够
@@ -116,21 +115,21 @@ def _gen_for_type(
     if scope:
         query_parts.append(scope)
     query_parts.append(type_label)
-    if progress_cb:
-        progress_cb(base_progress, f"正在检索「{type_label}」相关材料")
+    if report:
+        report(0.02, f"正在检索「{type_label}」相关材料")
     hits = retrieval.retrieve(
         params.kb_id,
         query=" ".join(query_parts),
         top_k=max(settings.top_k, tc.count * 2),
         doc_id=params.doc_id or None,
     )
-    if progress_cb:
-        progress_cb(base_progress + span_progress // 10, f"「{type_label}」检索完成，开始生成")
+    if report:
+        report(0.12, f"「{type_label}」检索完成，AI 生成中")
     if not hits:
         raise ValueError(f"知识库中没有可参考的内容，请先上传文档（检索「{type_label}」无结果）")
 
     # 模型偶发不守题型或与已有题重复，最多重试 3 轮并逐轮收紧约束
-    for _ in range(3):
+    for attempt in range(3):
         extra = f"- 知识点范围：{scope}" if scope else ""
         if mixed_difficulty:
             extra += "\n- 难度分布：约三分之一达到高难度，其余为中等难度"
@@ -158,6 +157,8 @@ def _gen_for_type(
                 },
             ]
         )
+        if report:
+            report(0.82, f"「{type_label}」AI 已返回，正在校验格式")
         raw = data.get("questions", data if isinstance(data, list) else [])
         questions: list[Question] = []
         for item in raw:
@@ -182,7 +183,11 @@ def _gen_for_type(
             questions.append(q)
             avoid_norm.add(norm)
         if len(questions) >= tc.count:
+            if report:
+                report(1.0, f"「{type_label}」已完成（{tc.count} 题）")
             return questions[: tc.count]
+        if report:
+            report(0.35 + 0.15 * attempt, f"「{type_label}」第 {attempt + 1} 轮不达标，正在重试")
     raise ValueError(f"{type_label}生成数量或去重后不达标（要求 {tc.count} 道），请重试")
 
 
@@ -194,20 +199,63 @@ def generate_questions(
     existing_stems: list[str] | None = None,
     progress_cb: ProgressCB | None = None,
 ) -> list[Question]:
-    avoid_norm = {_norm_stem(s) for s in (existing_stems or []) if s}
-    total = sum(tc.count for tc in params.types) or 1
+    """按题型并行出题：每个题型一个独立 agent（线程），全部完成后汇总呈现。
+
+    - 进度 = 各 agent 内部完成度（0~1）按题数加权的均值，映射到 5~95%；
+      各 agent 完成度单调递增，因此整体进度与实际剩余工作量一致，不会跳变
+    - 阶段文案取完成度最低（瓶颈）agent 的阶段，反映整体真实状态
+    - 去重集合每个 agent 独立副本：不同题型的题干天然不同，无需共享可变状态
+    - 任一 agent 失败（原题不足 / 检索为空 / 模型超时）整体抛出该异常
+    """
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    avoid_base = {_norm_stem(s) for s in (existing_stems or []) if s}
+    weights = [max(1, tc.count) for tc in params.types]
+    total_weight = sum(weights)
+    fracs = [0.0] * len(params.types)
+    stages = ["准备中"] * len(params.types)
+    lock = threading.Lock()
+
+    def make_report(idx: int) -> Callable[[float, str], None]:
+        def report(frac: float, stage: str) -> None:
+            with lock:
+                fracs[idx] = max(fracs[idx], min(1.0, max(0.0, frac)))
+                stages[idx] = stage
+                if progress_cb:
+                    weighted = sum(w * f for w, f in zip(weights, fracs)) / total_weight
+                    overall = 5 + int(90 * weighted)
+                    bottleneck = min(range(len(fracs)), key=lambda i: fracs[i])
+                    progress_cb(min(overall, 95), stages[bottleneck])
+
+        return report
+
+    def run_one(idx: int, tc) -> None:
+        fresh = _gen_for_type(
+            tc,
+            params,
+            doc_name,
+            scope,
+            set(avoid_base),
+            mixed_difficulty,
+            report=make_report(idx),
+        )
+        results[idx] = fresh
+
+    results: list[list[Question] | None] = [None] * len(params.types)
+    workers = max(1, min(len(params.types), 6))
+    if workers > 1:
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="qgen-agent") as pool:
+            futures = [pool.submit(run_one, idx, tc) for idx, tc in enumerate(params.types)]
+            for future in futures:
+                future.result()
+    else:
+        run_one(0, params.types[0])
+
     out: list[Question] = []
-    done = 0
-    # 进度分配：前 5% 初始化，每个题型占 (90% / 题型数)，末尾 5% 为校验收尾
-    type_span = 90 // max(1, len(params.types))
-    for idx, tc in enumerate(params.types):
-        base = 5 + idx * type_span
-        fresh = _gen_for_type(tc, params, doc_name, scope, avoid_norm, mixed_difficulty,
-                              progress_cb=progress_cb, base_progress=base, span_progress=type_span)
-        out.extend(fresh)
-        done += len(fresh)
-        if progress_cb:
-            progress_cb(base + type_span, f"已生成 {done}/{total} 题")
+    for fresh in results:
+        if fresh:
+            out.extend(fresh)
     if progress_cb:
-        progress_cb(96, "正在校验题目格式与去重")
+        progress_cb(96, f"正在校验题目格式与去重（共 {len(out)}/{sum(weights)} 题）")
     return out
