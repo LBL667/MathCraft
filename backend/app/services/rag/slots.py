@@ -4,8 +4,8 @@
 抽取交给模型（JSON 输出），只做结构化信息提取不做回复生成。
 """
 from app.schemas.question import Difficulty, QuestionType, TypeCount
-from app.services.llm import chat_json
-from app.services.prompts import SLOT_EXTRACT_SYSTEM
+from app.services.rag.llm import chat_json
+from app.services.rag.prompts import SLOT_EXTRACT_SYSTEM
 
 # 槽位检查顺序即追问顺序
 SLOT_ORDER = ["types", "scope", "source_mode", "difficulty"]
@@ -20,7 +20,7 @@ DIFFICULTY_ALIASES = {"简单": "低", "容易": "低", "基础": "低", "中等
 TYPE_ALIASES = {"选择": "single", "单选": "single", "多选": "multiple", "判断": "judge", "填空": "blank", "计算": "compute", "简答": "essay", "解答": "essay"}
 
 
-def extract_slots(message: str, history: list[dict]) -> dict:
+def extract_slots(message: str, history: list[dict], api_key: str | None = None) -> dict:
     """让模型从用户消息里抽取槽位，未提及的字段为 null。"""
     recent = "\n".join(f"{'用户' if h.get('role') == 'user' else '助手'}：{h.get('text', '')}" for h in history[-4:])
     prompt = (f"【最近对话】\n{recent}\n\n" if recent else "") + f"【当前用户消息】\n{message}"
@@ -28,7 +28,8 @@ def extract_slots(message: str, history: list[dict]) -> dict:
         [
             {"role": "system", "content": SLOT_EXTRACT_SYSTEM},
             {"role": "user", "content": prompt},
-        ]
+        ],
+        api_key=api_key,
     )
     return data if isinstance(data, dict) else {}
 
@@ -122,14 +123,14 @@ def build_followup(missing: list[str]) -> str:
     return "请告诉我以下信息：\n" + "\n".join(numbered)
 
 
-def build_params(state: dict, kb_id: str, doc_id: str) -> tuple:
+def build_params(state: dict, bank_id: str, document_id: str) -> tuple:
     """从完整槽位构造 GenerateParams 与 scope。"""
     types = [TypeCount(type=QuestionType(t["type"]), count=int(t.get("count") or 5)) for t in state["types"]]
     from app.schemas.question import GenerateParams
 
     params = GenerateParams(
-        kb_id=kb_id,
-        doc_id=doc_id,
+        kb_id=bank_id,
+        doc_id=document_id,
         types=types,
         difficulty=Difficulty(state.get("difficulty", "中")),
         source_mode=state.get("source_mode", "variant_data"),

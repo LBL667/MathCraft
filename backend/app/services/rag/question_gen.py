@@ -1,8 +1,9 @@
-"""出题服务：检索参考片段 + DeepSeek JSON 输出 + Pydantic 校验。
+"""出题服务：混合检索参考片段 + DeepSeek JSON 输出 + Pydantic 校验。
 
 - original 模式下先统计材料中该题型的原题数量，不足时抛 NeedConfirmError 询问用户
 - existing_stems 用于跨请求全局去重：prompt 约束 + 生成后按归一化题干过滤
 - progress_cb 用于向调用方上报真实生成进度（百分比 + 阶段文案）
+- api_key 为当前用户的 DeepSeek 密钥；retrieve_fn 可注入检索实现（测试用）
 """
 import re
 import uuid
@@ -10,11 +11,12 @@ from typing import Callable
 
 from app.config import settings
 from app.schemas.question import Difficulty, GenerateParams, Question, QuestionType
-from app.services import retrieval, vectorstore
-from app.services.llm import chat_json
-from app.services.prompts import QUESTION_SYSTEM, QUESTION_USER_TEMPLATE
+from app.services.rag import retrieval, vectorstore
+from app.services.rag.llm import chat_json
+from app.services.rag.prompts import QUESTION_SYSTEM, QUESTION_USER_TEMPLATE
 
 ProgressCB = Callable[[int, str], None]
+RetrieveFn = Callable[[str], list[dict]]
 
 TYPE_LABELS: dict[QuestionType, str] = {
     QuestionType.single: "选择题",
@@ -69,9 +71,9 @@ def _section_matches(section: str, qtype: QuestionType) -> bool:
     return False
 
 
-def count_available_originals(kb_id: str, doc_id: str, qtype: QuestionType) -> int | None:
+def count_available_originals(bank_id: str, doc_id: str, qtype: QuestionType) -> int | None:
     """统计材料中该题型的原题数量；材料没有题号结构时返回 None（跳过检查）。"""
-    chunks = vectorstore.count_question_chunks(kb_id, doc_id)
+    chunks = vectorstore.count_question_chunks(bank_id, doc_id)
     if not chunks:
         return None
     matched = [c for c in chunks if c["section"] and _section_matches(c["section"], qtype)]
@@ -88,7 +90,9 @@ def _norm_stem(s: str) -> str:
 def _build_context(hits: list[dict]) -> str:
     parts = []
     for i, h in enumerate(hits, 1):
-        parts.append(f"[片段{i} · {h['doc_name']}]\n{h['text']}")
+        label = h.get("section") or h.get("chunk_type") or ""
+        prefix = f" · {label}" if label else ""
+        parts.append(f"[片段{i}{prefix}]\n{h['text']}")
     return "\n\n".join(parts)
 
 
@@ -99,6 +103,9 @@ def _gen_for_type(
     scope: str | None,
     avoid_norm: set[str],
     mixed_difficulty: bool,
+    api_key: str | None,
+    hyde_text: str | None,
+    retrieve_fn: RetrieveFn | None = None,
     report: Callable[[float, str], None] | None = None,
 ) -> list[Question]:
     """生成单个题型的题目。report(frac, stage) 上报该 agent 的内部完成度（0~1）与阶段文案。"""
@@ -117,12 +124,10 @@ def _gen_for_type(
     query_parts.append(type_label)
     if report:
         report(0.02, f"正在检索「{type_label}」相关材料")
-    hits = retrieval.retrieve(
-        params.kb_id,
-        query=" ".join(query_parts),
-        top_k=max(settings.top_k, tc.count * 2),
-        doc_id=params.doc_id or None,
+    retrieve = retrieve_fn or (
+        lambda q: retrieval.retrieve_for_generation(params.kb_id, q, params.doc_id or None, hyde_text)
     )
+    hits = retrieve(" ".join(query_parts))
     if report:
         report(0.12, f"「{type_label}」检索完成，AI 生成中")
     if not hits:
@@ -155,7 +160,8 @@ def _gen_for_type(
                     "content": user_prompt
                     + f"\n\n【重要】本次生成的每一道题 type 字段必须严格为 {tc.type.value}（{type_label}），不得混入其他题型。",
                 },
-            ]
+            ],
+            api_key=api_key,
         )
         if report:
             report(0.82, f"「{type_label}」AI 已返回，正在校验格式")
@@ -198,12 +204,13 @@ def generate_questions(
     mixed_difficulty: bool = False,
     existing_stems: list[str] | None = None,
     progress_cb: ProgressCB | None = None,
+    api_key: str | None = None,
+    hyde_text: str | None = None,
+    retrieve_fn: RetrieveFn | None = None,
 ) -> list[Question]:
     """按题型并行出题：每个题型一个独立 agent（线程），全部完成后汇总呈现。
 
-    - 进度 = 各 agent 内部完成度（0~1）按题数加权的均值，映射到 5~95%；
-      各 agent 完成度单调递增，因此整体进度与实际剩余工作量一致，不会跳变
-    - 阶段文案取完成度最低（瓶颈）agent 的阶段，反映整体真实状态
+    - 进度 = 各 agent 内部完成度（0~1）按题数加权的均值，映射到 5~95%
     - 去重集合每个 agent 独立副本：不同题型的题干天然不同，无需共享可变状态
     - 任一 agent 失败（原题不足 / 检索为空 / 模型超时）整体抛出该异常
     """
@@ -238,6 +245,9 @@ def generate_questions(
             scope,
             set(avoid_base),
             mixed_difficulty,
+            api_key,
+            hyde_text,
+            retrieve_fn=retrieve_fn,
             report=make_report(idx),
         )
         results[idx] = fresh
