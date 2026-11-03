@@ -17,7 +17,7 @@ const NAV_ITEMS: {
 ]
 
 export default function SideNav() {
-  const { navCollapsed, toggleNav, showToast, activeTab, setActiveTab } = useApp()
+  const { navCollapsed, toggleNav, activeTab, setActiveTab } = useApp()
   return (
     <nav
       className={`z-10 flex shrink-0 flex-col border-r border-line/60 bg-white py-3 transition-all duration-300 ${
@@ -33,11 +33,7 @@ export default function SideNav() {
                 type="button"
                 title={navCollapsed ? label : undefined}
                 onClick={() => {
-                  if (tab) {
-                    setActiveTab(tab)
-                  } else {
-                    showToast('演示版当前仅开放「智能出题」与「题库管理」模块')
-                  }
+                  if (tab) setActiveTab(tab)
                 }}
                 className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm transition-colors ${
                   active
