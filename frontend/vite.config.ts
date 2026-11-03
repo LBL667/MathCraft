@@ -10,6 +10,8 @@ export default defineConfig({
     proxy: {
       // 前端所有 /api 请求转发到本地后端（用 127.0.0.1 避免 localhost 解析为 IPv6 连不上）
       '/api': 'http://127.0.0.1:8000',
+      // 头像等媒体文件
+      '/media': 'http://127.0.0.1:8000',
     },
   },
 })
