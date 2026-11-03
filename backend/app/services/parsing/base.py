@@ -51,6 +51,7 @@ PARSERS: dict[str, str] = {
     ".xls": "excel",
     ".md": "markdown",
     ".markdown": "markdown",
+    ".txt": "txt",
 }
 
 
@@ -73,6 +74,10 @@ def get_parser(file_path: Path) -> Parser:
         from app.services.parsing import excel as excel_parser
 
         return excel_parser.ExcelParser()
+    if suffix == ".txt":
+        from app.services.parsing import txt as txt_parser
+
+        return txt_parser.TxtParser()
     from app.services.parsing import markdown as md_parser
 
     return md_parser.MarkdownParser()

@@ -1,7 +1,7 @@
 """PDF 解析：PyMuPDF 提取文字层；无可提取文本时走 OCR 引擎。"""
 from pathlib import Path
 
-import fitz
+import pymupdf as fitz
 
 from app.services.parsing.base import OCREngine, ParsedBlock
 
