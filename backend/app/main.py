@@ -1,33 +1,71 @@
-"""RiddleMe 后端入口。启动：uv run uvicorn app.main:app --port 8000"""
-from fastapi import FastAPI
+"""MathCraft 后端入口。
+
+启动：uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
+"""
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 
-from app.api import chat, generate, kb
 from app.config import settings
+from app.errors import AppError
+from app.services.rag import tokenizer  # 预热 jieba 词典
 
-app = FastAPI(title="RiddleMe Backend", version="0.1.0")
+from app.api import (
+    attempts,
+    auth,
+    banks,
+    chat,
+    documents,
+    favorites,
+    generate,
+    health,
+    papers,
+    questions,
+    spaces,
+    urges,
+    users,
+)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # 确保 jieba 词典在服务启动时构建完成，避免首个请求卡顿
+    tokenizer.tokenize("预热")
+    yield
+
+
+app = FastAPI(title="MathCraft Backend", version="0.2.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.cors_origin_list(),
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-app.include_router(kb.router)
+app.include_router(health.router)
+app.include_router(auth.router)
+app.include_router(users.router)
+app.include_router(banks.router)
+app.include_router(documents.router)
 app.include_router(generate.router)
+app.include_router(questions.router)
+app.include_router(favorites.router)
 app.include_router(chat.router)
+app.include_router(spaces.router)
+app.include_router(papers.router)
+app.include_router(urges.router)
+app.include_router(attempts.router)
+
+# 头像等本地媒体文件
+app.mount("/media", StaticFiles(directory=str(settings.avatar_path())), name="media")
 
 
-@app.get("/api/health")
-def health():
-    """组件连通性自检：ollama 向量模型、DeepSeek 配置。"""
-    status = {"chroma_dir": str(settings.chroma_path()), "deepseek_key": bool(settings.deepseek_api_key)}
-    try:
-        from app.services.embeddings import embed_one
+@app.exception_handler(AppError)
+async def app_error_handler(_request: Request, exc: AppError):
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.to_detail()})
 
-        dim = len(embed_one("ping"))
-        status["ollama_embedding"] = f"ok({dim}d)"
-    except Exception as exc:
-        status["ollama_embedding"] = f"fail: {exc}"
-    return status
