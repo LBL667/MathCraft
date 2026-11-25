@@ -1,32 +1,26 @@
-/** 题库信息编辑弹窗：基本信息、管理员权限级别、成员管理（设/取消管理员、转让、移出）、文档与上传 */
-import { useRef, useState } from 'react'
-import type { DragEvent } from 'react'
+/** 题库信息编辑弹窗：基本信息、创建者管理成员、文档预览与入库进度 */
+import { useEffect, useRef, useState } from 'react'
 import {
-  ArrowLeftRight,
-  Crown,
   Download,
+  Eye,
   FileUp,
   FolderCog,
   Settings2,
-  ShieldCheck,
   Trash2,
-  UserMinus,
-  UserPlus,
   UserX,
   Users,
   X,
 } from 'lucide-react'
 import * as bankApi from '../../../api/banks'
-import type { AdminLevel, ManagedBank } from '../../../api/banks'
-import { useApp } from '../../../store/AppContext'
-import { Avatar, FormatBadge, SectionTitle } from './shared'
-import ConfirmDialog from '../../ui/ConfirmDialog'
+import type { BankDoc, ManagedBank } from '../../../api/banks'
+import { openPdfDocument } from '../../../api/documentPreview'
+import { assertCurrentSession, getSessionGeneration } from '../../../api/session'
+import { useToast } from '../../../store/ToastContext'
+import { updateBank } from '../../../api/backend'
+import { Avatar, DocumentDropZone, DocumentFailure, FormatBadge, SectionTitle } from './shared'
+import DocPreviewModal from './DocPreviewModal'
 import { useDocUpload } from './useDocUpload'
-
-const LEVELS: { key: AdminLevel; title: string; desc: string }[] = [
-  { key: 'normal', title: '普通管理员', desc: '可上传和下载文档' },
-  { key: 'super', title: '超级管理员', desc: '可编辑文档，包括删除、上传、下载和查看' },
-]
+import { useDocDeletion } from './useDocDeletion'
 
 export default function BankEditModal({
   bank,
@@ -35,43 +29,100 @@ export default function BankEditModal({
 }: {
   bank: ManagedBank
   onClose: () => void
-  onChanged: () => void
+  onChanged: (deletedDocumentId?: string) => void
 }) {
-  const { showToast } = useApp()
+  const { showToast } = useToast()
+  const [saveError, setSaveError] = useState('')
+  const saveLock = useRef(false)
   const [name, setName] = useState(bank.name)
-  const [adminLevel, setAdminLevel] = useState<AdminLevel>(bank.adminLevel)
+  const [memberAccount, setMemberAccount] = useState('')
+  const [memberRole, setMemberRole] = useState<'editor' | 'readonly'>('readonly')
   const [docs, setDocs] = useState(bank.docs)
+  const { remove: removeDoc, pendingIds } = useDocDeletion(bank.id, setDocs, onChanged)
   const [members, setMembers] = useState(bank.members)
-  const [transferTarget, setTransferTarget] = useState<{ id: string; name: string } | null>(null)
-  const [dragOver, setDragOver] = useState(false)
-  const fileInput = useRef<HTMLInputElement>(null)
-  const { upload, start } = useDocUpload(bank.id, (doc) => setDocs((prev) => [...prev, doc]), showToast)
+  const [preview, setPreview] = useState<BankDoc | null>(null)
+  const [saving, setSaving] = useState(false)
+  const session = useRef(getSessionGeneration())
+  const { start, busy: uploading } = useDocUpload(bank.id, () => {
+    onChanged()
+    void bankApi.getBankDetail(bank.id).then((fresh) => {
+      assertCurrentSession(session.current)
+      setDocs(fresh.docs)
+    })
+      .catch((err) => showToast(err instanceof Error ? err.message : '刷新文档失败', 'error'))
+  }, showToast)
 
-  const levelLabel = adminLevel === 'super' ? '超级管理员' : '普通管理员'
   const iconBtn = 'flex h-7 w-7 items-center justify-center rounded-md transition-colors'
 
-  const onDrop = (e: DragEvent) => {
-    e.preventDefault()
-    setDragOver(false)
-    const file = e.dataTransfer.files?.[0]
-    if (file) start(file)
-  }
+  // 有文档正在上传/解析/向量化时，每 3 秒轮询一次处理阶段
+  const processing = docs.some((d) => d.status && !['ready', 'failed', 'deleting'].includes(d.status))
+  useEffect(() => {
+    if (!processing) return
+    const timer = window.setInterval(() => {
+      if (session.current !== getSessionGeneration()) return
+      void bankApi
+        .getBankDetail(bank.id)
+        .then((fresh) => {
+          assertCurrentSession(session.current)
+          setDocs(fresh.docs)
+        })
+        .catch((err) => showToast(err instanceof Error ? err.message : '刷新文档失败', 'error'))
+    }, 3000)
+    return () => window.clearInterval(timer)
+  }, [processing, bank.id, showToast])
 
-  const save = async () => {
-    if (!name.trim()) {
-      showToast('题库名称不能为空')
+  const close = () => {
+    if (uploading || saveLock.current) {
+      showToast('正在上传或保存，请等待完成后再关闭', 'error')
       return
     }
-    await bankApi.updateBank(bank.id, { name: name.trim(), adminLevel })
-    showToast('题库信息已保存')
-    onChanged()
     onClose()
   }
 
+  const save = async () => {
+    if (!bank.canEdit || saveLock.current) return
+    if (uploading) {
+      showToast('文档正在批量上传，请等待完成后再保存', 'error')
+      return
+    }
+    if (!name.trim()) {
+      setSaveError('题库名称不能为空')
+      showToast('题库名称不能为空', 'error')
+      return
+    }
+    saveLock.current = true
+    setSaving(true)
+    setSaveError('')
+    let writeConfirmed = false
+    try {
+      await updateBank(bank.id, { name: name.trim() })
+      writeConfirmed = true
+      const fresh = await bankApi.getBankDetail(bank.id)
+      assertCurrentSession(session.current)
+      setName(fresh.name)
+      setDocs(fresh.docs)
+      setMembers(fresh.members)
+      onChanged()
+      showToast('题库信息已保存', 'success')
+      onClose()
+    } catch (err) {
+      const message = writeConfirmed ? '题库信息已保存，但最新状态读取失败。请关闭后重新打开核对。' : err instanceof Error ? err.message : '保存题库失败'
+      setSaveError(message)
+      showToast(message, 'error')
+    } finally {
+      saveLock.current = false
+      setSaving(false)
+    }
+  }
+
+  if (!bank.canEdit || bank.status === 'deleting') return null
+
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-[#0f1b33]/45 p-4" onClick={onClose}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-[#0f1b33]/45 p-4" onClick={close}
+      onKeyDown={(event) => { if (event.key === 'Escape') { event.stopPropagation(); close() } }}>
       <div
-        className="flex max-h-[88vh] w-[620px] flex-col overflow-hidden rounded-2xl bg-white shadow-2xl"
+        role="dialog" aria-modal="true" aria-label={`题库信息 · ${bank.name}`} aria-busy={uploading || saving}
+        className="flex max-h-[88vh] w-[620px] max-w-full flex-col overflow-hidden rounded-2xl bg-white shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
         {/* 弹窗头部 */}
@@ -80,7 +131,7 @@ export default function BankEditModal({
             <FolderCog size={18} className="text-primary" />
             <h3 className="text-base font-bold text-ink">题库信息 · {bank.name}</h3>
           </div>
-          <button type="button" onClick={onClose} className="rounded p-1 text-ink-3 transition-colors hover:bg-page hover:text-ink">
+          <button type="button" onClick={close} disabled={uploading || saving} aria-label="关闭题库信息" className="rounded p-1 text-ink-3 transition-colors hover:bg-page hover:text-ink disabled:opacity-50">
             <X size={18} />
           </button>
         </div>
@@ -94,10 +145,14 @@ export default function BankEditModal({
               <input
                 type="text"
                 value={name}
-                onChange={(e) => setName(e.target.value)}
+                disabled={saving}
+                aria-invalid={!!saveError}
+                aria-describedby={saveError ? 'bank-save-error' : undefined}
+                onChange={(e) => { setName(e.target.value); setSaveError('') }}
                 className="block w-full rounded-lg border border-line px-3 py-2 text-sm text-ink outline-none transition-colors focus:border-primary"
               />
             </label>
+            {saveError && <p id="bank-save-error" role="alert" className="text-sm text-red-700">{saveError}</p>}
             <label className="block">
               <span className="mb-1 block text-xs text-ink-3">题库编号（只读）</span>
               <input
@@ -109,123 +164,112 @@ export default function BankEditModal({
             </label>
           </section>
 
-          {/* 管理员权限级别 */}
-          <section className="space-y-2.5">
-            <SectionTitle icon={ShieldCheck}>管理员权限级别</SectionTitle>
-            <div className="grid grid-cols-2 gap-2.5">
-              {LEVELS.map((lv) => (
-                <button
-                  key={lv.key}
-                  type="button"
-                  onClick={() => setAdminLevel(lv.key)}
-                  className={`rounded-xl border p-3 text-left transition-colors ${
-                    adminLevel === lv.key
-                      ? 'border-primary bg-primary-light/40 shadow-[0_2px_8px_rgba(30,111,255,0.12)]'
-                      : 'border-line hover:border-primary/40 hover:bg-page'
-                  }`}
-                >
-                  <div className="flex items-center gap-1.5">
-                    <ShieldCheck size={14} className={adminLevel === lv.key ? 'text-primary' : 'text-ink-3'} />
-                    <span className={`text-sm font-semibold ${adminLevel === lv.key ? 'text-primary' : 'text-ink'}`}>
-                      {lv.title}
-                    </span>
-                  </div>
-                  <p className="mt-1 text-xs leading-5 text-ink-3">{lv.desc}</p>
-                </button>
-              ))}
+          {/* 成员权限 */}
+          {bank.canManageMembers && <section className="space-y-2.5">
+            <SectionTitle icon={Users}>成员权限</SectionTitle>
+            <p className="text-xs text-ink-3">创建者可按登录账号添加成员。可编辑成员能维护共享资料，只读成员只能查看、下载、检索和出题。</p>
+            <div className="flex gap-2">
+              <label className="sr-only" htmlFor="member-account">成员登录账号</label>
+              <input
+                id="member-account"
+                value={memberAccount}
+                onChange={(event) => setMemberAccount(event.target.value)}
+                placeholder="登录账号"
+                className="min-w-0 flex-1 rounded-lg border border-line px-3 py-2 text-sm"
+              />
+              <label className="sr-only" htmlFor="member-role">成员权限</label>
+              <select
+                id="member-role"
+                value={memberRole}
+                onChange={(event) => {
+                  if (event.target.value === 'editor' || event.target.value === 'readonly') {
+                    setMemberRole(event.target.value)
+                  }
+                }}
+                className="rounded-lg border border-line px-3 py-2 text-sm"
+              >
+                <option value="readonly">只读</option>
+                <option value="editor">可编辑</option>
+              </select>
+              <button
+                type="button"
+                onClick={async () => {
+                  try {
+                    const member = await bankApi.addMember(bank.id, memberAccount.trim(), memberRole)
+                    setMembers((prev) => [...prev, member])
+                    setMemberAccount('')
+                    showToast('成员已添加', 'success')
+                    onChanged()
+                  } catch (err) {
+                    showToast(err instanceof Error ? err.message : '添加成员失败', 'error')
+                  }
+                }}
+                disabled={!memberAccount.trim()}
+                className="rounded-lg bg-primary px-3 py-2 text-sm font-semibold text-white disabled:opacity-50"
+              >
+                添加
+              </button>
             </div>
-            <p className="text-xs text-ink-3">当前级别对本题库全部管理员生效；创建者恒为超级管理员</p>
-          </section>
+          </section>}
 
-          {/* 成员管理（含设/取消管理员、转让、移出） */}
+          {/* 成员列表 */}
           <section className="space-y-2.5">
             <SectionTitle icon={Users}>题库成员（{members.length} 人）</SectionTitle>
             <ul className="divide-y divide-line/60 rounded-xl border border-line">
-              {members.map((m) => {
-                const isCreator = m.isCreator
-                const isMe = m.isMe
-                return (
-                  <li key={m.id} className="flex items-center justify-between gap-2 px-3 py-2.5">
-                    <div className="flex items-center gap-2.5">
-                      <Avatar name={m.name} size="sm" />
-                      <span className="text-sm text-ink">{m.name}</span>
-                      {isCreator && (
-                        <span className="inline-flex items-center gap-0.5 rounded bg-primary-light px-1.5 py-0.5 text-[10px] font-semibold text-primary">
-                          <Crown size={10} /> 创建者
-                        </span>
-                      )}
-                      {!isCreator && m.isAdmin && (
-                        <span className="inline-flex items-center gap-0.5 rounded bg-amber-50 px-1.5 py-0.5 text-[10px] font-semibold text-amber-600">
-                          {levelLabel}
-                        </span>
-                      )}
-                      {isMe && <span className="rounded bg-page px-1.5 py-0.5 text-[10px] text-ink-3">我</span>}
+              {members.map((member) => (
+                <li key={member.id} className="flex items-center justify-between gap-2 px-3 py-2.5">
+                  <div className="flex items-center gap-2.5">
+                    <Avatar name={member.name} size="sm" />
+                    <span className="text-sm text-ink">{member.name}</span>
+                    <span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${member.isCreator ? 'bg-primary-light text-primary' : member.role === 'editor' ? 'bg-amber-50 text-amber-600' : 'bg-page text-ink-3'}`}>
+                      {member.isCreator ? '创建者' : member.role === 'editor' ? '可编辑' : '只读'}
+                    </span>
+                    {member.isMe && <span className="rounded bg-page px-1.5 py-0.5 text-[10px] text-ink-3">我</span>}
+                  </div>
+                  {bank.canManageMembers && !member.isMe && !member.isCreator && (
+                    <div className="flex items-center gap-2">
+                      <select
+                        aria-label={`${member.name}的权限`}
+                        value={member.role}
+                        onChange={async (event) => {
+                          const role = event.target.value
+                          if (role !== 'editor' && role !== 'readonly') return
+                          try {
+                            await bankApi.setMemberRole(bank.id, member.id, role)
+                            setMembers((prev) => prev.map((item) => item.id === member.id ? { ...item, role } : item))
+                            showToast('成员权限已更新', 'success')
+                            onChanged()
+                          } catch (err) {
+                            showToast(err instanceof Error ? err.message : '更新成员权限失败', 'error')
+                          }
+                        }}
+                        className="rounded border border-line px-2 py-1 text-xs"
+                      >
+                        <option value="readonly">只读</option>
+                        <option value="editor">可编辑</option>
+                      </select>
+                      <button
+                        type="button"
+                        title="移出题库"
+                        onClick={async () => {
+                          try {
+                            await bankApi.removeMember(bank.id, member.id)
+                            setMembers((prev) => prev.filter((item) => item.id !== member.id))
+                            showToast(`已将 ${member.name} 移出题库`, 'success')
+                            onChanged()
+                          } catch (err) {
+                            showToast(err instanceof Error ? err.message : '移出成员失败', 'error')
+                          }
+                        }}
+                        className={`${iconBtn} text-red-500 hover:bg-red-50`}
+                      >
+                        <UserX size={14} />
+                      </button>
                     </div>
-                    {!isMe && !isCreator && (
-                      <div className="flex items-center gap-1">
-                        {m.isAdmin ? (
-                          <button
-                            type="button"
-                            title="取消管理员"
-                            onClick={async () => {
-                              try {
-                                await bankApi.unsetAdmin(bank.id, m.id)
-                                setMembers((prev) => prev.map((x) => (x.id === m.id ? { ...x, isAdmin: false } : x)))
-                                showToast(`已取消 ${m.name} 的管理员权限`)
-                              } catch (err) {
-                                showToast(err instanceof Error ? err.message : '操作失败')
-                              }
-                            }}
-                            className={`${iconBtn} text-amber-600 hover:bg-amber-50`}
-                          >
-                            <UserMinus size={14} />
-                          </button>
-                        ) : (
-                          <button
-                            type="button"
-                            title={`设为${levelLabel}`}
-                            onClick={async () => {
-                              await bankApi.setAdmin(bank.id, m.id)
-                              setMembers((prev) => prev.map((x) => (x.id === m.id ? { ...x, isAdmin: true } : x)))
-                              showToast(`已将 ${m.name} 设为${levelLabel}`)
-                            }}
-                            className={`${iconBtn} text-primary hover:bg-primary-light`}
-                          >
-                            <UserPlus size={14} />
-                          </button>
-                        )}
-                        <button
-                          type="button"
-                          title={`把题库转让给 ${m.name}`}
-                          onClick={() => setTransferTarget({ id: m.id, name: m.name })}
-                          className={`${iconBtn} text-violet-500 hover:bg-violet-50`}
-                        >
-                          <ArrowLeftRight size={14} />
-                        </button>
-                        <button
-                          type="button"
-                          title="移出题库"
-                          onClick={async () => {
-                            try {
-                              await bankApi.removeMember(bank.id, m.id)
-                              setMembers((prev) => prev.filter((x) => x.id !== m.id))
-                              showToast(`已将 ${m.name} 移出题库`)
-                              onChanged()
-                            } catch (err) {
-                              showToast(err instanceof Error ? err.message : '操作失败')
-                            }
-                          }}
-                          className={`${iconBtn} text-red-500 hover:bg-red-50`}
-                        >
-                          <UserX size={14} />
-                        </button>
-                      </div>
-                    )}
-                  </li>
-                )
-              })}
+                  )}
+                </li>
+              ))}
             </ul>
-            <p className="text-xs text-ink-3">成员操作：设为管理员、取消管理员、转让题库、移出题库（悬停图标查看）</p>
           </section>
 
           {/* 文档列表 */}
@@ -233,86 +277,89 @@ export default function BankEditModal({
             <SectionTitle icon={FileUp}>已上传文档（{docs.length}）</SectionTitle>
             {docs.length === 0 && <p className="text-xs text-ink-3">暂无文档，可在下方上传</p>}
             <ul className="space-y-1.5">
-              {docs.map((d) => (
-                <li key={d.id} className="flex items-center gap-2.5 rounded-lg border border-line px-3 py-2">
-                  <FormatBadge format={d.format} />
-                  <span className="flex-1 truncate text-sm text-ink">{d.name}</span>
-                  <span className="text-xs text-ink-3">{d.size}</span>
-                  <button
-                    type="button"
-                    title="下载文档"
-                    onClick={() => void bankApi.downloadDoc(bank.id, d.id, d.name).catch((err) => showToast(err instanceof Error ? err.message : '下载失败'))}
-                    className="rounded p-1 text-ink-3 transition-colors hover:bg-primary-light hover:text-primary"
-                  >
-                    <Download size={14} />
-                  </button>
-                  <button
-                    type="button"
-                    title="删除文档"
-                    onClick={async () => {
-                      await bankApi.removeDoc(bank.id, d.id)
-                      setDocs((prev) => prev.filter((x) => x.id !== d.id))
-                      onChanged()
-                    }}
-                    className="rounded p-1 text-ink-3 transition-colors hover:bg-red-50 hover:text-red-500"
-                  >
-                    <Trash2 size={14} />
-                  </button>
-                </li>
-              ))}
+              {docs.map((d) => {
+                const deleting = d.status === 'deleting'
+                const deletingNow = pendingIds.has(d.id)
+                const busy = d.status && !['ready', 'failed', 'deleting'].includes(d.status)
+                const failed = d.status === 'failed'
+                return (
+                  <li key={d.id} className="rounded-lg border border-line px-3 py-2">
+                    <div className="flex items-center gap-2.5">
+                      <FormatBadge format={d.format} />
+                      <span className="flex-1 truncate text-sm text-ink">{d.name}</span>
+                      <span
+                        title={failed ? d.stage ?? '' : undefined}
+                        className={`mr-3 text-xs ${
+                          deleting || deletingNow ? 'text-amber-700' : failed ? 'text-red-500' : busy ? 'text-primary' : 'text-emerald-600'
+                        }`}
+                      >
+                        {deleting || deletingNow ? '删除中' : failed ? '入库失败' : busy ? `${d.stage ?? '处理中'} ${d.progress ?? 0}%` : '可用'}
+                      </span>
+                      <button
+                        type="button"
+                        title="查看文档"
+                        aria-label={`查看文档 ${d.name}`}
+                        disabled={deleting || deletingNow}
+                        onClick={() => {
+                          const format = d.format.toUpperCase()
+                          if (format === 'PDF') {
+                            void openPdfDocument(bank.id, d.id).catch((err) => showToast(err instanceof Error ? err.message : '打开 PDF 失败', 'error'))
+                          } else if (['MD', 'MARKDOWN', 'TXT'].includes(format)) {
+                            setPreview(d)
+                          } else {
+                            showToast(`${format} 暂不支持内联预览，请使用下载按钮`, 'info')
+                          }
+                        }}
+                        className="rounded p-1 text-ink-3 transition-colors hover:bg-primary-light hover:text-primary disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        <Eye size={14} />
+                      </button>
+                      <button
+                        type="button"
+                        title="下载文档"
+                        aria-label={`下载文档 ${d.name}`}
+                        disabled={deleting || deletingNow}
+                        onClick={() => void bankApi.downloadDoc(bank.id, d.id, d.name).catch((err) => showToast(err instanceof Error ? err.message : '下载失败', 'error'))}
+                        className="rounded p-1 text-ink-3 transition-colors hover:bg-primary-light hover:text-primary disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        <Download size={14} />
+                      </button>
+                      <button
+                        type="button"
+                        title={deleting ? '继续清理' : '删除文档'}
+                        aria-label={`${deleting ? '继续清理' : '删除文档'} ${d.name}`}
+                        disabled={deletingNow || !!busy}
+                        onClick={() => void removeDoc(d)}
+                        className="inline-flex items-center rounded p-1 text-ink-3 transition-colors hover:bg-red-50 hover:text-red-500 disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        <Trash2 size={14} />
+                        {deleting && <span className="ml-1 text-xs">继续清理</span>}
+                      </button>
+                    </div>
+                    {!deleting && !deletingNow && ['DOCX', 'XLSX'].includes(d.format.toUpperCase()) && <p className="mt-1 text-xs text-ink-3">暂不支持内联预览，请使用下载按钮。</p>}
+                    <DocumentFailure doc={d} onRetry={bank.canUpload && !deletingNow ? async () => {
+                      try {
+                        await bankApi.reprocessDoc(bank.id, d.id)
+                        assertCurrentSession(session.current)
+                        onChanged()
+                        showToast(`「${d.name}」已重新排队解析`, 'success')
+                        const fresh = await bankApi.getBankDetail(bank.id)
+                        assertCurrentSession(session.current)
+                        setDocs(fresh.docs)
+                      } catch (err) {
+                        showToast(err instanceof Error ? err.message : '重新解析失败', 'error')
+                      }
+                    } : undefined} />
+                  </li>
+                )
+              })}
             </ul>
 
             {/* 上传区域 */}
-            <div
-              onDragOver={(e) => {
-                e.preventDefault()
-                setDragOver(true)
-              }}
-              onDragLeave={() => setDragOver(false)}
-              onDrop={onDrop}
-              onClick={() => fileInput.current?.click()}
-              className={`flex cursor-pointer flex-col items-center justify-center gap-1.5 rounded-xl border-2 border-dashed px-4 py-5 text-center transition-colors ${
-                dragOver ? 'border-primary bg-primary-light/40' : 'border-line hover:border-primary/50 hover:bg-page'
-              }`}
-            >
-              <FileUp size={20} className="text-primary" />
-              <p className="text-sm text-ink-2">点击选择或拖拽文件到此处上传</p>
-              <p className="text-xs text-ink-3">支持 PDF / DOCX / XLSX / MD / TXT，上传后自动向量化</p>
-              <input
-                ref={fileInput}
-                type="file"
-                accept=".pdf,.docx,.xlsx,.md,.markdown,.txt"
-                className="hidden"
-                onChange={(e) => {
-                  const f = e.target.files?.[0]
-                  if (f) start(f)
-                  e.target.value = ''
-                }}
-              />
-            </div>
-
-            {/* 上传与向量化进度 */}
-            {upload && (
-              <div className="rounded-xl border border-primary/30 bg-primary-light/30 p-3">
-                <div className="mb-1.5 flex items-center justify-between text-xs">
-                  <span className="truncate font-medium text-ink">{upload.name}</span>
-                  <span className={upload.phase === 'done' ? 'text-emerald-600' : 'text-primary'}>
-                    {upload.phase === 'upload' && `上传中 ${Math.floor(upload.pct)}%`}
-                    {upload.phase === 'vector' && `向量化中 ${Math.floor(upload.pct)}%`}
-                    {upload.phase === 'done' && '已完成'}
-                  </span>
-                </div>
-                <div className="h-2 overflow-hidden rounded-full bg-white">
-                  <div
-                    className={`h-full rounded-full transition-all duration-150 ${upload.phase === 'vector' ? 'bg-violet-500' : 'bg-primary'}`}
-                    style={{ width: `${upload.pct}%` }}
-                  />
-                </div>
-                <p className="mt-1 text-[11px] text-ink-3">
-                  {upload.phase === 'vector' ? '正在对文档内容做切片与向量索引' : '正在上传至题库'}
-                </p>
-              </div>
-            )}
+            {bank.canUpload && <DocumentDropZone busy={uploading} onFiles={(files) => {
+              if (saving) { showToast('正在保存题库，请稍后再上传', 'error'); return }
+              void start(files)
+            }} />}
           </section>
         </div>
 
@@ -320,36 +367,34 @@ export default function BankEditModal({
         <div className="flex justify-end gap-2.5 border-t border-line px-5 py-3.5">
           <button
             type="button"
-            onClick={onClose}
+            onClick={close}
+            disabled={uploading || saving}
             className="rounded-lg border border-line px-4 py-2 text-sm text-ink-2 transition-colors hover:bg-page"
           >
             取消
           </button>
           <button
             type="button"
-            onClick={save}
+            onClick={() => void save()}
+            disabled={saving || uploading}
             className="rounded-lg bg-primary px-5 py-2 text-sm font-semibold text-white shadow-[0_4px_14px_rgba(30,111,255,0.35)] transition-colors hover:bg-[#1a5fe6]"
           >
-            保存
+            {saving ? '保存中…' : '保存'}
           </button>
         </div>
       </div>
 
-      {transferTarget && (
-        <ConfirmDialog
-          title="确认转让题库"
-          message={`转让后你将失去管理员权限，该题库移入「我加入的题库」。确定转让给「${transferTarget.name}」吗？`}
-          confirmText="确认转让"
-          danger={false}
-          onConfirm={async () => {
-            await bankApi.transferBank(bank.id, transferTarget.id)
-            showToast(`题库已转让给 ${transferTarget.name}`)
-            onChanged()
-            onClose()
-          }}
-          onClose={() => setTransferTarget(null)}
+      {preview && (
+        <DocPreviewModal
+          key={preview.id}
+          bankId={bank.id}
+          docId={preview.id}
+          docName={preview.name}
+          docFormat={preview.format}
+          onClose={() => setPreview(null)}
         />
       )}
+
     </div>
   )
 }

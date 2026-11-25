@@ -12,10 +12,23 @@ export interface OptionItem {
 
 export interface Question {
   id: string
+  /** 试卷快照中的原始题号；题库题目没有题号。 */
+  no?: number
   type: QuestionType
   /** 分值 */
   score: number
   difficulty: Difficulty
+  /** 盲评加权总分 1~5，0 表示未评估 */
+  difficultyScore?: number
+  /** 盲评明细：各维分、判定档与缺陷码 */
+  difficultyReview?: {
+    total?: number
+    tier?: string
+    scores?: Record<string, number>
+    defectCodes?: string[]
+    suggestion?: string
+    passed?: boolean
+  }
   /** 题干，内联 LaTeX 用 $...$ 包裹 */
   stem: string
   /** 客观题选项；主观题为空数组 */
@@ -37,10 +50,16 @@ export interface KnowledgeBase {
   name: string
 }
 
+/** 文档入库状态，与后端文档契约一致。 */
+export type DocumentStatus = 'uploaded' | 'parsing' | 'ocr' | 'chunking' | 'embedding' | 'ready' | 'failed' | 'deleting'
+
 export interface KbDocument {
   id: string
   kbId: string
   name: string
+  status?: DocumentStatus
+  stage?: string | null
+  progress?: number
 }
 
 export interface StudySpace {
@@ -58,8 +77,8 @@ export interface StudySpace {
 
 /** 做题时间窗口（不限时间时不传或为 null） */
 export interface ExamWindow {
-  start: string
-  end: string
+  start: string | null
+  end: string | null
 }
 
 export interface GenerateParams {
@@ -101,11 +120,15 @@ export interface PublishPayload {
 
 export interface AssembleRecord {
   id: string
+  closed: boolean
+  deleted: boolean
   name: string
   createdAt: string
   questionCount: number
   totalScore: number
   spaces: string[]
+  /** 发布空间的稳定标识及各自停止状态。 */
+  publications?: { spaceId: string; stopped: boolean }[]
   /** 发布状态：发布 / 未发布（草稿） */
   published?: boolean
   /** 组卷时的题目快照，供组卷记录查看 */
@@ -133,6 +156,41 @@ export interface ChatMessage {
   id: string
   role: 'user' | 'assistant'
   text: string
+  /** 随消息发送的图片（data URL），仅在当前会话内存中保留 */
+  images?: string[]
+}
+
+export type ChatMode = 'generate' | 'creative' | 'qa' | 'data'
+
+export const CHAT_MODE_LABELS: Record<ChatMode, string> = {
+  generate: '快速出题',
+  creative: '创新命题',
+  qa: '知识答疑',
+  data: '数据管理',
+}
+
+/** 数据管理高危操作的确认载荷 */
+export interface ChatConfirm {
+  id: string
+  action: 'delete' | 'update'
+  entity: string
+  entity_label: string
+  affected: number
+  samples: string[]
+  explanation: string
+}
+
+export interface ChatReply {
+  reply: string
+  questions: unknown[]
+  done: boolean
+  batch_id: string | null
+  slot_state: Record<string, unknown>
+  kind: 'reply' | 'mode_mismatch' | 'mode_confirm'
+  mode: ChatMode
+  mode_changed: boolean
+  suggested_template: ChatMode | 'none' | null
+  confirm: ChatConfirm | null
 }
 
 /** 题目收藏分组（default 组固定存在，不可删除） */
@@ -147,7 +205,7 @@ export interface FavoriteGroup {
 export interface TeacherProfile {
   name: string
   avatar: string
-  gender: '男' | '女'
+  gender: '' | '男' | '女'
   phone: string
   email: string
   teacherId: string

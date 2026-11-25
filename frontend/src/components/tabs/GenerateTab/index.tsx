@@ -1,22 +1,65 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import type { DragEvent } from 'react'
-import { Bot, FileUp } from 'lucide-react'
+import { Bot, Copy, ImagePlus, Loader2, Pencil, RotateCcw } from 'lucide-react'
 import { useApp } from '../../../store/AppContext'
+import { Latex } from '../../../lib/latex'
 import RobotAvatar from './RobotAvatar'
-import QuickPrompts from './QuickPrompts'
 import ChatInput from './ChatInput'
 
-/** Agent出题标签页：欢迎态（机器人 + 快捷提问）与对话态；支持拖拽文档到对话区上传 */
+/** Agent出题标签页：机器人欢迎态、对话与输入框附着审批；支持图片与文档拖入 */
 export default function GenerateTab() {
-  const { messages, botThinking, uploadDocument, profile } = useApp()
-  const showWelcome = messages.length === 0 && !botThinking
+  const {
+    messages, botThinking, uploadDocument, profile, retryChat, editChat,
+    showToast, chatProgress, chatStartedAt, addChatImages, pendingConfirm, confirmBusy,
+    sessionLoading, questionsClearing, generating, generationRecoveryError,
+  } = useApp()
+  const showWelcome = messages.length === 0 && !botThinking && pendingConfirm === null && !sessionLoading
+  const interactionBusy = botThinking || sessionLoading || questionsClearing || generating
+    || generationRecoveryError !== null || confirmBusy || pendingConfirm !== null
   const [dragOver, setDragOver] = useState(false)
+  const [now, setNow] = useState(() => Date.now())
+
+  useEffect(() => {
+    if (!botThinking) return
+    const timer = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [botThinking])
+
+  const elapsed = chatStartedAt ? Math.max(0, Math.floor((now - chatStartedAt) / 1000)) : 0
+  const elapsedText = elapsed >= 60 ? `${Math.floor(elapsed / 60)} 分 ${elapsed % 60} 秒` : `${elapsed} 秒`
 
   const onDrop = (e: DragEvent) => {
     e.preventDefault()
     setDragOver(false)
-    const file = e.dataTransfer.files?.[0]
-    if (file) void uploadDocument(file)
+    const files = Array.from(e.dataTransfer.files ?? [])
+    const images = files.filter((f) => f.type.startsWith('image/'))
+    const docs = files.filter((f) => !f.type.startsWith('image/'))
+    if (images.length) addChatImages(images)
+    if (docs.length) void uploadDocument(docs[0])
+  }
+
+  // 用户消息：最新一条有复制、编辑后重发；历史消息只保留复制。AI 回复最新一条保留重新生成。
+  const lastAssistantIndex = messages.reduce((acc, m, i) => (m.role === 'assistant' ? i : acc), -1)
+  const lastUserIndex = messages.reduce((acc, m, i) => (m.role === 'user' ? i : acc), -1)
+  const regenerateFrom = (assistantIndex: number) => {
+    if (interactionBusy) return
+    for (let j = assistantIndex - 1; j >= 0; j--) {
+      if (messages[j].role === 'user') {
+        retryChat(messages[j].id)
+        return
+      }
+    }
+  }
+
+  const copyText = (text: string) => {
+    if (!navigator.clipboard) {
+      showToast('当前环境无法复制，请手动复制', 'error')
+      return
+    }
+    void navigator.clipboard.writeText(text).then(
+      () => showToast('已复制'),
+      () => showToast('复制失败'),
+    )
   }
 
   return (
@@ -28,57 +71,137 @@ export default function GenerateTab() {
       }}
       onDragLeave={(e) => {
         e.preventDefault()
-        if (!e.currentTarget.contains(e.relatedTarget as Node)) setDragOver(false)
+        if (!(e.relatedTarget instanceof Node) || !e.currentTarget.contains(e.relatedTarget)) setDragOver(false)
       }}
       onDrop={onDrop}
     >
       <div className="min-h-0 flex-1 overflow-y-auto">
-        {showWelcome ? (
-          <div className="flex h-full flex-col items-center justify-center px-8 pb-4">
-            <RobotAvatar />
-            <h2 className="mt-4 text-[24px] font-bold text-ink">你好，我是AI出题助手</h2>
-            <p className="mt-3 max-w-[460px] text-center text-sm leading-6 text-ink-2">
-              我可以根据你的需求，结合知识库内容，为你生成高质量的试题。
-              <br />
-              你可以直接提出出题要求，或告诉我相关的知识点、难度、题型等信息。
-            </p>
-            <QuickPrompts />
+        {sessionLoading ? (
+          <div className="flex h-full items-center justify-center" role="status" aria-label="正在加载历史会话" aria-live="polite">
+            <Loader2 size={22} className="animate-spin text-primary" />
           </div>
-        ) : (
-          <div className="mx-auto flex w-full max-w-[880px] flex-col gap-4 px-8 py-6">
-            {messages.map((m) => (
-              <div key={m.id} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                <div className={`flex max-w-[80%] items-start gap-2 ${m.role === 'user' ? 'flex-row-reverse' : ''}`}>
-                  <span
-                    className={`mt-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-sm ${
-                      m.role === 'user' ? 'bg-primary font-semibold text-white' : 'bg-primary-light text-primary'
-                    }`}
-                  >
-                    {m.role === "user" ? profile.name.charAt(0) : <Bot size={16} />}
-                  </span>
-                  <div
-                    className={`rounded-2xl px-4 py-2.5 text-[15px] leading-7 ${
-                      m.role === 'user'
-                        ? 'rounded-tr-sm bg-primary text-white'
-                        : 'rounded-tl-sm border border-line bg-white text-ink'
-                    }`}
-                  >
-                    {m.text}
+        ) : showWelcome ? (
+            <div className="flex min-h-full flex-col items-center justify-center px-8 pb-10">
+              <RobotAvatar />
+              <h2 className="mt-2 text-[24px] font-bold text-ink">你好，我是AI出题助手</h2>
+            </div>
+          ) : (
+            <div className="mx-auto flex w-full max-w-[980px] flex-col gap-4 px-6 py-6">
+              {messages.map((m, i) => (
+                <div key={m.id} className={`group flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                  <div className={`flex max-w-[88%] items-start gap-3.5 ${m.role === 'user' ? 'flex-row-reverse' : ''}`}>
+                    <span
+                      className={`mt-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-sm ${
+                        m.role === 'user' ? 'bg-primary font-semibold text-white' : 'bg-primary-light text-primary'
+                      }`}
+                    >
+                      {m.role === "user" ? profile.name.charAt(0) : <Bot size={16} />}
+                    </span>
+                    <div className="flex min-w-0 flex-col">
+                      <div
+                        className={`max-w-full overflow-hidden whitespace-pre-wrap break-words rounded-2xl px-4 py-2.5 text-[15px] leading-7 ${
+                          m.role === 'user'
+                            ? 'rounded-tr-sm bg-primary text-white'
+                            : 'chat-answer rounded-tl-sm border border-line bg-white text-ink'
+                        }`}
+                      >
+                        {m.images?.length ? (
+                          <div className="mb-2 flex flex-wrap gap-2">
+                            {m.images.map((src, idx) => (
+                              <img
+                                key={`${i}-${idx}`}
+                                src={src}
+                                alt={`随消息发送的图片 ${idx + 1}`}
+                                className="h-24 w-24 rounded-lg border border-white/40 object-cover"
+                              />
+                            ))}
+                          </div>
+                        ) : null}
+                        {m.role === 'assistant' ? <Latex text={m.text} /> : m.text}
+                      </div>
+                      {m.role === 'user' && (
+                        <div className="mt-1 flex justify-end gap-0.5 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:focus-within:opacity-100">
+                          <button
+                            type="button"
+                            title="复制"
+                            aria-label="复制用户消息"
+                            onClick={() => copyText(m.text)}
+                            className="rounded p-1 text-ink-3 transition-colors hover:bg-page hover:text-primary"
+                          >
+                            <Copy size={13} />
+                          </button>
+                          {i === lastUserIndex && (
+                            <button
+                              type="button"
+                              title="编辑后重发"
+                              aria-label="编辑后重发"
+                              disabled={interactionBusy}
+                              onClick={() => {
+                                if (!interactionBusy) editChat(m.id)
+                              }}
+                              className="rounded p-1.5 text-ink-3 transition-colors hover:bg-page hover:text-primary disabled:cursor-not-allowed disabled:opacity-45"
+                            >
+                              <Pencil size={13} />
+                            </button>
+                          )}
+                        </div>
+                      )}
+                      {m.role === 'assistant' && (
+                        <div className="mt-1 flex items-center gap-0.5 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:focus-within:opacity-100">
+                          <button
+                            type="button"
+                            title="复制"
+                            aria-label="复制助手消息"
+                            onClick={() => copyText(m.text)}
+                            className="rounded p-1 text-ink-3 transition-colors hover:bg-page hover:text-primary"
+                          >
+                            <Copy size={13} />
+                          </button>
+                          {i === lastAssistantIndex && (
+                            <button
+                              type="button"
+                              title="基于你的上一条消息重新生成"
+                              disabled={interactionBusy}
+                              onClick={() => regenerateFrom(i)}
+                              className="ml-2 flex items-center gap-1 rounded p-1 text-xs text-ink-3 transition-colors hover:bg-page hover:text-primary disabled:cursor-not-allowed disabled:opacity-45"
+                            >
+                              <RotateCcw size={13} />
+                              重新生成
+                            </button>
+                          )}
+                        </div>
+                      )}
+                    </div>
                   </div>
                 </div>
-              </div>
-            ))}
-            {botThinking && (
-              <div className="flex justify-start">
-                <div className="flex items-center gap-1.5 rounded-2xl rounded-tl-sm border border-line bg-white px-4 py-3">
-                  <span className="h-1.5 w-1.5 animate-dot rounded-full bg-primary/60" />
-                  <span className="h-1.5 w-1.5 animate-dot rounded-full bg-primary/60 [animation-delay:0.15s]" />
-                  <span className="h-1.5 w-1.5 animate-dot rounded-full bg-primary/60 [animation-delay:0.3s]" />
+              ))}
+              {botThinking && (
+                <div className="flex justify-start" role="status" aria-label="正在处理对话请求" aria-live="polite">
+                  <div className="flex flex-col gap-2 rounded-2xl rounded-tl-sm border border-line bg-white px-4 py-3">
+                    <div className="flex items-center gap-1.5">
+                      <span className="h-1.5 w-1.5 animate-dot rounded-full bg-primary/60" />
+                      <span className="h-1.5 w-1.5 animate-dot rounded-full bg-primary/60 [animation-delay:0.15s]" />
+                      <span className="h-1.5 w-1.5 animate-dot rounded-full bg-primary/60 [animation-delay:0.3s]" />
+                    </div>
+                    {chatProgress?.stage && (
+                      <div className="flex items-center gap-2">
+                        <span className="h-1 w-24 overflow-hidden rounded-full bg-page" role="progressbar" aria-label="对话处理进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.max(0, Math.min(100, chatProgress.percent))}>
+                          <span
+                            className="block h-full rounded-full bg-primary transition-all duration-500"
+                            style={{ width: `${Math.max(4, Math.min(100, chatProgress.percent))}%` }}
+                          />
+                        </span>
+                        <span className="text-xs text-ink-3">
+                          {chatProgress.stage}
+                          <span className="ml-1 text-ink-3/70">· 已等待 {elapsedText}</span>
+                        </span>
+                      </div>
+                    )}
+                  </div>
                 </div>
-              </div>
-            )}
-          </div>
-        )}
+              )}
+            </div>
+          )}
       </div>
       <ChatInput />
 
@@ -86,10 +209,10 @@ export default function GenerateTab() {
       {dragOver && (
         <div className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-2 bg-primary-light/70 backdrop-blur-[1px]">
           <span className="flex h-14 w-14 items-center justify-center rounded-full bg-white text-primary shadow-lg">
-            <FileUp size={26} />
+            <ImagePlus size={26} />
           </span>
-          <p className="text-sm font-semibold text-primary">松开以上传文档到当前知识库</p>
-          <p className="text-xs text-ink-2">支持 PDF / DOCX / XLSX / MD，上传后自动入库</p>
+          <p className="text-sm font-semibold text-primary">松开即可添加</p>
+          <p className="text-xs text-ink-2">图片将随下一条消息发送；PDF / DOCX / XLSX / MD 自动入库</p>
         </div>
       )}
     </div>

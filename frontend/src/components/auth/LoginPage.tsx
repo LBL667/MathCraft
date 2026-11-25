@@ -1,60 +1,75 @@
-/**
- * 登录页：设计迁移自 html/index.html（视觉保持原样）。
- * 变更点：忘记密码改为占位提示、固定布局禁滚动、品牌区去 logo 并左移、
- * 登录成功后整页淡出并与主应用淡入衔接。
- */
-import { useCallback, useEffect, useRef, useState } from 'react'
-import { login as apiLogin, changePassword } from '../../api/auth'
+/** 管理员开通账号，默认密码登录；绑定邮箱后可使用验证码登录。 */
+import { useEffect, useRef, useState } from 'react'
+import type { FormEvent } from 'react'
+import { ArrowRight, Eye, EyeOff, LockKeyhole, UserRound } from 'lucide-react'
+import { ApiError, developmentAccount, getAuthConfig, loginAccount } from '../../api/auth'
 import type { AuthRole, AuthUser } from '../../api/auth'
 import { useAuth } from '../../store/AuthContext'
+import { AuthDialog } from './AuthDialog'
+import { LoginEmailBindingDialog } from './LoginEmailBindingDialog'
+import { Turnstile } from './Turnstile'
 import '../../styles/login.css'
 
-/** 身份切换的文案映射（保持原登录页设计） */
-const ROLE_COPY: Record<AuthRole, { lede: string; cta: string; account: string }> = {
-  student: { lede: '登录后继续练习与错题回顾', cta: '进入学习空间', account: '手机号或邮箱' },
-  teacher: { lede: '登录后继续出题、组卷与发布', cta: '进入教师工作台', account: '工号、手机号或邮箱' },
-}
-
-interface FieldHint {
-  text: string
-  on: boolean
-}
-
-const EMPTY_HINT: FieldHint = { text: '', on: false }
-
 export default function LoginPage() {
-  const { signIn } = useAuth()
-
-  const [role, setRole] = useState<AuthRole>('student')
-  const [account, setAccount] = useState('')
-  const [password, setPassword] = useState('')
-  const [showPassword, setShowPassword] = useState(false)
-  const [loading, setLoading] = useState(false)
-  const [leaving, setLeaving] = useState(false)
-  const [accountHint, setAccountHint] = useState<FieldHint>(EMPTY_HINT)
-  const [passwordHint, setPasswordHint] = useState<FieldHint>(EMPTY_HINT)
-  const [status, setStatus] = useState<{ text: string; tone?: 'warn' | 'ok' } | null>(null)
-  const [pwdOpen, setPwdOpen] = useState(false)
-  const [pwdAccount, setPwdAccount] = useState('')
-  const [pwdOld, setPwdOld] = useState('')
-  const [pwdNew, setPwdNew] = useState('')
-  const [pwdConfirm, setPwdConfirm] = useState('')
-  const [pwdBusy, setPwdBusy] = useState(false)
-  const [pwdStatus, setPwdStatus] = useState<{ text: string; tone?: 'warn' | 'ok' } | null>(null)
+  const stageRef = useRef<HTMLDivElement>(null)
   const cardRef = useRef<HTMLDivElement>(null)
   const dustRef = useRef<HTMLCanvasElement>(null)
+  const emailLoginRef = useRef<HTMLButtonElement>(null)
+  const [role, setRole] = useState<Exclude<AuthRole, 'admin'>>('student')
+  const [showPassword, setShowPassword] = useState(false)
+  const { signIn, restoreError, logoutError, authNotice, restore, logout } = useAuth()
+  const [dialog, setDialog] = useState<'email' | 'reset' | 'bind' | null>(null)
+  const [account, setAccount] = useState('')
+  const [password, setPassword] = useState('')
+  const [token, setToken] = useState('')
+  const [turnstileRequired, setTurnstileRequired] = useState(true)
+  const [epoch, setEpoch] = useState(0)
+  const [busy, setBusy] = useState(false)
+  const [status, setStatus] = useState('')
+  const [retryAt, setRetryAt] = useState(0)
+  const [now, setNow] = useState(Date.now)
+  const [devEnabled, setDevEnabled] = useState(false)
+  const [adminContact, setAdminContact] = useState('请联系本校或平台管理员')
 
-  // 登录页标题
   useEffect(() => {
-    const prev = document.title
-    document.title = '登录 · MathCraft 智能出题平台'
+    const viewport = window.visualViewport
+    const stage = stageRef.current
+    if (!viewport || !stage) return
+    // 软键盘和页面放大可能只改变视觉视口，不改变 100dvh。
+    function syncViewport() {
+      if (!viewport || !stage) return
+      stage.style.setProperty('--login-viewport-height', `${viewport.height}px`)
+      stage.style.setProperty('--login-viewport-width', `${viewport.width}px`)
+      stage.style.setProperty('--login-viewport-top', `${viewport.offsetTop}px`)
+      stage.style.setProperty('--login-viewport-left', `${viewport.offsetLeft}px`)
+    }
+    syncViewport()
+    viewport.addEventListener('resize', syncViewport)
+    viewport.addEventListener('scroll', syncViewport)
     return () => {
-      document.title = prev
+      viewport.removeEventListener('resize', syncViewport)
+      viewport.removeEventListener('scroll', syncViewport)
     }
   }, [])
 
-  const resetField = useCallback((setter: React.Dispatch<React.SetStateAction<FieldHint>>) => {
-    setter(EMPTY_HINT)
+  useEffect(() => {
+    let active = true
+    async function loadConfig() {
+      try {
+        const config = await getAuthConfig()
+        if (!active) return
+        setAdminContact(config.admin_contact || '请联系本校或平台管理员')
+        setDevEnabled(import.meta.env.DEV && window.location.hostname === '127.0.0.1' && config.development_accounts_enabled === true)
+      } catch (error: unknown) {
+        if (active) setStatus(error instanceof Error ? error.message : '认证配置加载失败')
+      }
+    }
+    void loadConfig()
+    return () => { active = false }
+  }, [])
+  useEffect(() => {
+    const id = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => window.clearInterval(id)
   }, [])
 
   /* ---------- 粒子层：移植自原登录页 initDust ---------- */
@@ -229,350 +244,141 @@ export default function LoginPage() {
     card.style.setProperty('--my', `${((e.clientY - r.top) / r.height) * 100}%`)
   }
 
-  /* ---------- 登录提交 ---------- */
-  const submit = async (e: React.FormEvent) => {
-    e.preventDefault()
-    if (loading || leaving) return
-
-    let ok = true
-    if (!account.trim()) {
-      setAccountHint({ text: '请填写账号，手机号或邮箱都可以', on: true })
-      ok = false
-    }
-    if (password.length < 6) {
-      setPasswordHint({ text: password ? '密码至少 6 位' : '请填写密码', on: true })
-      ok = false
-    }
-    if (!ok) {
-      setStatus({ text: '还差一步，检查一下标红的输入框', tone: 'warn' })
-      return
-    }
-
-    setLoading(true)
-    setStatus({ text: '正在验证账号' })
-    try {
-      const authUser: AuthUser = await apiLogin(account, password, role)
-      setStatus({ text: '登录成功，正在进入工作台', tone: 'ok' })
-      // 先播整页淡出，再把用户写入全局状态切换到主应用，衔接更丝滑
-      setLeaving(true)
-      window.setTimeout(() => signIn(authUser), 340)
-    } catch (err) {
-      setLoading(false)
-      setStatus({ text: err instanceof Error ? err.message : '登录失败，请稍后再试', tone: 'warn' })
-    }
+  function clearPassword() {
+    setShowPassword(false)
+    setPassword('')
+    setToken('')
+    setEpoch(value => value + 1)
   }
 
-  /* ---------- 未登录修改密码 ---------- */
-  const submitPassword = async () => {
-    if (!pwdAccount.trim() || !pwdOld || !pwdNew) {
-      setPwdStatus({ text: '请填写账号、原密码和新密码', tone: 'warn' })
-      return
+  function openDialog(next: 'email' | 'reset' | 'bind') {
+    if (busy) return
+    clearPassword()
+    setStatus('')
+    setDialog(next)
+  }
+
+  function closeDialog() {
+    setDialog(null)
+    clearPassword()
+    if (dialog === 'bind') window.requestAnimationFrame(() => emailLoginRef.current?.focus())
+  }
+
+  async function completeLogin(user: AuthUser) {
+    setPassword('')
+    if (user.role !== 'admin' && user.role !== role) {
+      await logout()
+      throw new Error(`该账号为${user.role === 'teacher' ? '教师' : '学生'}账号，请选择对应身份后重新登录`)
     }
-    if (pwdNew.length < 6) {
-      setPwdStatus({ text: '新密码至少 6 位', tone: 'warn' })
-      return
-    }
-    if (pwdNew !== pwdConfirm) {
-      setPwdStatus({ text: '两次输入的新密码不一致', tone: 'warn' })
-      return
-    }
-    setPwdBusy(true)
+    signIn(user)
+  }
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (busy || dialog !== null || now < retryAt) return
+    if (turnstileRequired && !token) { setStatus('请先完成人机验证'); return }
+    setBusy(true)
+    setStatus('')
     try {
-      await changePassword(pwdAccount.trim(), pwdOld, pwdNew, role)
-      setPwdStatus({ text: '密码已修改，请使用新密码登录', tone: 'ok' })
-      setPwdOld('')
-      setPwdNew('')
-      setPwdConfirm('')
-      setPassword('')
-    } catch (err) {
-      setPwdStatus({ text: err instanceof Error ? err.message : '修改密码失败', tone: 'warn' })
+      const user = await loginAccount(account.trim(), password, token)
+      await completeLogin(user)
+    } catch (reason: unknown) {
+      if (reason instanceof ApiError && reason.retryAfter) setRetryAt(Date.now() + reason.retryAfter * 1000)
+      setStatus(reason instanceof Error ? reason.message : '认证失败，请稍后重试')
     } finally {
-      setPwdBusy(false)
+      setBusy(false)
+      setToken('')
+      setEpoch(value => value + 1)
     }
   }
 
-  return (
-    <div className="stage" data-leaving={leaving ? 'true' : undefined}>
-      {/* 背景与质感层 */}
-      <div className="login-bg" aria-hidden="true" />
-      <canvas ref={dustRef} className="login-dust" aria-hidden="true" />
-      <div className="login-grain" aria-hidden="true" />
-      <div className="login-vignette" aria-hidden="true" />
+  async function retryLogout() {
+    setBusy(true)
+    try { await logout() }
+    catch (reason: unknown) { setStatus(reason instanceof Error ? reason.message : '服务端退出尚未确认') }
+    finally { setBusy(false) }
+  }
 
-      {/* 品牌：去掉左侧 logo，整体左移 */}
-      <header className="login-brand">
-        <span>
-          <span className="login-brand__name">MathCraft</span>
-          <span className="login-brand__sub">智能出题平台</span>
-        </span>
-      </header>
+  async function fillDevelopment(role: Exclude<AuthRole, 'admin'>) {
+    setRole(role)
+    setBusy(true)
+    setStatus('')
+    try {
+      const sample = await developmentAccount(role)
+      clearPassword()
+      setAccount(sample.account)
+      setPassword(sample.password)
+      setStatus(turnstileRequired ? '已填充开发账号，请完成人机验证后手动登录' : '已填充开发账号，请手动登录')
+    } catch (reason: unknown) {
+      setStatus(reason instanceof Error ? reason.message : '开发账号不可用')
+    } finally { setBusy(false) }
+  }
 
-      {/* 主体 */}
-      <div className="login-layout">
-        <section className="login-intro">
-          <div className="login-intro__rule" aria-hidden="true" />
-          <h2>
-            从知识库
-            <br />
-            到成套题目
-          </h2>
-          <p>上传课件与教材，按章节、难度和题型生成题干与解析，再一键成卷发布。</p>
-        </section>
-
-        <section className="login-panel" aria-labelledby="login-title">
-          <div className="login-halo" aria-hidden="true" />
-
-          <div className="login-card" ref={cardRef} onPointerMove={onCardPointerMove}>
-            <div className="login-card__head">
-              <h1 id="login-title">欢迎回来</h1>
-              <p className="login-lede">{ROLE_COPY[role].lede}</p>
-            </div>
-
-            <form className="login-form" noValidate onSubmit={(e) => void submit(e)}>
-              <fieldset className="login-seg">
-                <legend>选择身份</legend>
-                <input
-                  type="radio"
-                  id="role-student"
-                  name="role"
-                  value="student"
-                  checked={role === 'student'}
-                  onChange={() => {
-                    setRole('student')
-                    resetField(setAccountHint)
-                    resetField(setPasswordHint)
-                    setStatus(null)
-                  }}
-                />
-                <label htmlFor="role-student" className={role === 'student' ? 'is-active' : ''}>
-                  学生
-                </label>
-                <input
-                  type="radio"
-                  id="role-teacher"
-                  name="role"
-                  value="teacher"
-                  checked={role === 'teacher'}
-                  onChange={() => {
-                    setRole('teacher')
-                    resetField(setAccountHint)
-                    resetField(setPasswordHint)
-                    setStatus(null)
-                  }}
-                />
-                <label htmlFor="role-teacher" className={role === 'teacher' ? 'is-active' : ''}>
-                  老师
-                </label>
-                <span className={`login-seg__thumb ${role === 'teacher' ? 'is-right' : ''}`} aria-hidden="true" />
-              </fieldset>
-
-              <div className="login-field">
-                <label className="login-field__label" htmlFor="account">
-                  账号
-                </label>
-                <div className="login-field__box" data-invalid={accountHint.on ? 'true' : undefined}>
-                  <svg
-                    className="login-field__icon"
-                    width="18"
-                    height="18"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="1.7"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    aria-hidden="true"
-                  >
-                    <circle cx="12" cy="8" r="3.6" />
-                    <path d="M4.8 19.6a7.2 7.2 0 0 1 14.4 0" />
-                  </svg>
-                  <input
-                    id="account"
-                    name="account"
-                    type="text"
-                    inputMode="email"
-                    autoComplete="username"
-                    value={account}
-                    onChange={(e) => {
-                      setAccount(e.target.value)
-                      resetField(setAccountHint)
-                      setStatus(null)
-                    }}
-                    placeholder={ROLE_COPY[role].account}
-                    enterKeyHint="next"
-                  />
-                </div>
-                <p className="login-hint" aria-live="polite" data-on={accountHint.on ? 'true' : undefined}>
-                  {accountHint.text}
-                </p>
-              </div>
-
-              <div className="login-field">
-                <label className="login-field__label" htmlFor="password">
-                  密码
-                </label>
-                <div className="login-field__box" data-invalid={passwordHint.on ? 'true' : undefined}>
-                  <svg
-                    className="login-field__icon"
-                    width="18"
-                    height="18"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="1.7"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    aria-hidden="true"
-                  >
-                    <rect x="4.5" y="10.4" width="15" height="9.6" rx="2.6" />
-                    <path d="M8.2 10.4V7.8a3.8 3.8 0 0 1 7.6 0v2.6" />
-                  </svg>
-                  <input
-                    id="password"
-                    name="password"
-                    type={showPassword ? 'text' : 'password'}
-                    autoComplete="current-password"
-                    value={password}
-                    onChange={(e) => {
-                      setPassword(e.target.value)
-                      resetField(setPasswordHint)
-                      setStatus(null)
-                    }}
-                    placeholder="请输入密码"
-                    enterKeyHint="go"
-                  />
-                  <button
-                    className="login-reveal"
-                    type="button"
-                    aria-label={showPassword ? '隐藏密码' : '显示密码'}
-                    aria-pressed={showPassword}
-                    onClick={() => setShowPassword((v) => !v)}
-                  >
-                    {showPassword ? (
-                      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                        <path d="M4 4.6 20 20" />
-                        <path d="M9.7 6a10.8 10.8 0 0 1 2.3-.4c6 0 9.6 6.4 9.6 6.4a17.6 17.6 0 0 1-3.2 3.9" />
-                        <path d="M6.5 7.7A16.4 16.4 0 0 0 2.4 12S6 18.4 12 18.4a10.4 10.4 0 0 0 3.4-.5" />
-                        <path d="M9.9 9.9a3 3 0 0 0 4.2 4.2" />
-                      </svg>
-                    ) : (
-                      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                        <path d="M2.4 12S6 5.6 12 5.6 21.6 12 21.6 12 18 18.4 12 18.4 2.4 12 2.4 12Z" />
-                        <circle cx="12" cy="12" r="2.9" />
-                      </svg>
-                    )}
-                  </button>
-                </div>
-                <p className="login-hint" aria-live="polite" data-on={passwordHint.on ? 'true' : undefined}>
-                  {passwordHint.text}
-                </p>
-              </div>
-
-              <div className="login-assist">
-                <button
-                  type="button"
-                  className="login-link"
-                  onClick={() => {
-                    setPwdAccount(account)
-                    setPwdStatus(null)
-                    setPwdOpen(true)
-                  }}
-                >
-                  修改密码
-                </button>
-                <button
-                  type="button"
-                  className="login-link"
-                  onClick={() => setStatus({ text: '功能暂未开发', tone: 'warn' })}
-                >
-                  忘记密码？
-                </button>
-              </div>
-
-              <button className="login-cta" type="submit" disabled={loading || leaving} data-loading={loading ? 'true' : undefined}>
-                <span className="login-cta__spin" aria-hidden="true" />
-                <span>{ROLE_COPY[role].cta}</span>
-              </button>
-
-              <p className="login-status" role="status" aria-live="polite" data-tone={status?.tone}>
-                {status?.text}
-              </p>
-            </form>
+  return <div ref={stageRef} className="stage auth-stage">
+    <div className="login-decoration" aria-hidden="true"><div className="login-bg" /><canvas ref={dustRef} className="login-dust" /><div className="login-grain" /><div className="login-vignette" /></div>
+    <header className="login-brand"><span><span className="login-brand__name">MathCraft</span><span className="login-brand__sub">智能出题平台</span></span></header>
+    <div className="login-layout">
+      <section className="login-intro" aria-labelledby="login-intro-title">
+        <div className="login-intro__rule" aria-hidden="true" />
+        <h2 id="login-intro-title">从知识库<br />到成套题目</h2>
+        <p>上传课件与教材，按章节、难度和题型生成题干与解析，再一键成卷发布。</p>
+      </section>
+      <section className="login-panel" aria-labelledby="login-title"><div className="login-halo" aria-hidden="true" /><div className="login-card" ref={cardRef} onPointerMove={onCardPointerMove}><div className="login-card__body" tabIndex={0} role="region" aria-labelledby="login-title">
+        <div className="login-card__head"><h1 id="login-title">欢迎回来</h1><p className="login-lede">{role === 'teacher' ? '登录后继续出题、组卷与发布' : '登录后继续练习与错题回顾'}</p></div>
+        {authNotice && <p role="status" className="auth-notice">{authNotice}</p>}
+        {logoutError && <div role="alert" className="auth-notice">{logoutError}<button type="button" disabled={busy} onClick={() => void retryLogout()}>重试退出</button></div>}
+        {restoreError && <div role="alert" className="auth-notice">{restoreError}<button type="button" disabled={busy} onClick={restore}>重试恢复</button></div>}
+        <fieldset className="login-seg" disabled={busy}>
+          <legend>选择身份</legend>
+          {(['student', 'teacher'] as const).map(item => <span key={item} className="login-role-option">
+            <input type="radio" id={`role-${item}`} name="role" value={item} checked={role === item} onChange={() => { setRole(item); setStatus('') }} />
+            <label htmlFor={`role-${item}`} className={role === item ? 'is-active' : ''}>{item === 'student' ? '学生' : '教师'}</label>
+          </span>)}
+          <span className={`login-seg__thumb${role === 'teacher' ? ' is-right' : ''}`} aria-hidden="true" />
+        </fieldset>
+        <form className="login-form auth-form" onSubmit={event => void submit(event)}>
+          <fieldset className="auth-fields" disabled={busy}>
+            <label className="auth-field"><span>登录账号</span><span className="login-field__box"><UserRound size={18} className="login-field__icon" aria-hidden="true" /><input aria-label="登录账号" placeholder="请输入管理员分配的登录账号" required autoComplete="username" value={account} maxLength={64} onChange={event => setAccount(event.target.value)} /></span></label>
+            <label className="auth-field"><span>密码</span><span className="login-field__box"><LockKeyhole size={18} className="login-field__icon" aria-hidden="true" /><input aria-label="密码" placeholder="请输入密码" type={showPassword ? 'text' : 'password'} autoComplete="current-password" required value={password} onChange={event => setPassword(event.target.value)} /><button className="login-reveal" type="button" aria-label={showPassword ? '隐藏密码' : '显示密码'} aria-pressed={showPassword} onClick={() => setShowPassword(value => !value)}>{showPassword ? <EyeOff size={18} aria-hidden="true" /> : <Eye size={18} aria-hidden="true" />}</button></span></label>
+            <Turnstile key={epoch} action="password_login" onToken={setToken} onRequired={setTurnstileRequired} />
+          </fieldset>
+          <div className="login-assist">
+            <button ref={emailLoginRef} className="login-link auth-link" type="button" disabled={busy} onClick={() => openDialog('email')}>邮箱登录</button>
+            <button className="login-link auth-link" type="button" disabled={busy} onClick={() => openDialog('reset')}>忘记密码？</button>
           </div>
-        </section>
-      </div>
-
-      <footer className="login-legal">
-        <span>© 2026 MathCraft</span>
-        <span className="login-legal__tag">
-          <span className="login-legal__dot" aria-hidden="true" />
-          v0.1.0
-        </span>
-      </footer>
-
-      {pwdOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-[#0f1b33]/45 p-4" onClick={() => setPwdOpen(false)}>
-          <div className="w-[420px] overflow-hidden rounded-2xl bg-white shadow-2xl" onClick={(e) => e.stopPropagation()}>
-            <div className="flex items-center justify-between border-b border-line px-5 py-4">
-              <h3 className="text-base font-bold text-ink">修改密码</h3>
-              <button type="button" onClick={() => setPwdOpen(false)} className="rounded p-1 text-ink-3 hover:bg-page">
-                ×
-              </button>
-            </div>
-            <div className="space-y-3 px-5 py-4">
-              <p className="text-xs text-ink-3">身份：{role === 'teacher' ? '老师' : '学生'}</p>
-              <input
-                type="text"
-                value={pwdAccount}
-                onChange={(e) => setPwdAccount(e.target.value)}
-                placeholder="账号"
-                className="block w-full rounded-lg border border-line px-3 py-2 text-sm text-ink outline-none focus:border-primary"
-              />
-              <input
-                type="password"
-                value={pwdOld}
-                onChange={(e) => setPwdOld(e.target.value)}
-                placeholder="原密码"
-                className="block w-full rounded-lg border border-line px-3 py-2 text-sm text-ink outline-none focus:border-primary"
-              />
-              <input
-                type="password"
-                value={pwdNew}
-                onChange={(e) => setPwdNew(e.target.value)}
-                placeholder="新密码（至少 6 位）"
-                className="block w-full rounded-lg border border-line px-3 py-2 text-sm text-ink outline-none focus:border-primary"
-              />
-              <input
-                type="password"
-                value={pwdConfirm}
-                onChange={(e) => setPwdConfirm(e.target.value)}
-                placeholder="确认新密码"
-                className="block w-full rounded-lg border border-line px-3 py-2 text-sm text-ink outline-none focus:border-primary"
-              />
-              {pwdStatus && (
-                <p className={`text-xs ${pwdStatus.tone === 'ok' ? 'text-emerald-600' : 'text-amber-600'}`}>{pwdStatus.text}</p>
-              )}
-            </div>
-            <div className="flex justify-end gap-2.5 border-t border-line px-5 py-3.5">
-              <button
-                type="button"
-                onClick={() => setPwdOpen(false)}
-                className="rounded-lg border border-line px-4 py-2 text-sm text-ink-2 hover:bg-page"
-              >
-                取消
-              </button>
-              <button
-                type="button"
-                onClick={() => void submitPassword()}
-                disabled={pwdBusy}
-                className="rounded-lg bg-primary px-5 py-2 text-sm font-semibold text-white disabled:opacity-60"
-              >
-                {pwdBusy ? '提交中…' : '确认修改'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+          {status && <p className="auth-notice" role="status">{status}</p>}
+          <button className="login-cta" data-loading={busy} type="submit" disabled={busy || now < retryAt || (turnstileRequired && !token)}><span className="login-cta__spin" aria-hidden="true" /><span>{busy ? '处理中…' : now < retryAt ? Math.ceil((retryAt - now) / 1000) + ' 秒后重试' : role === 'teacher' ? '进入教师工作台' : '进入学习空间'}</span><ArrowRight size={18} aria-hidden="true" /></button>
+        </form>
+        {import.meta.env.DEV && devEnabled && window.location.hostname === '127.0.0.1' && <div className="auth-dev">{(['student', 'teacher'] as const).map(item => <button key={item} type="button" disabled={busy} onClick={() => void fillDevelopment(item)}>填充{item === 'student' ? '学生' : '教师'}开发账号</button>)}</div>}
+      </div></div></section>
     </div>
-  )
+    <footer className="login-legal"><span>© 2026 MathCraft</span><span className="login-legal__tag"><span className="login-legal__dot" aria-hidden="true" />v0.1.0</span></footer>
+    {dialog === 'bind' && <LoginEmailBindingDialog
+      role={role}
+      initialAccount={account}
+      now={now}
+      retryAt={retryAt}
+      onRateLimit={seconds => setRetryAt(Date.now() + seconds * 1000)}
+      onClose={closeDialog}
+      onBack={() => setDialog('email')}
+      onBound={() => {
+        closeDialog()
+        setStatus('邮箱已绑定，所有设备已退出，请重新登录')
+      }}
+    />}
+    {(dialog === 'email' || dialog === 'reset') && <AuthDialog
+      kind={dialog}
+      adminContact={adminContact}
+      now={now}
+      retryAt={retryAt}
+      onRateLimit={seconds => setRetryAt(Date.now() + seconds * 1000)}
+      onAuthenticated={completeLogin}
+      onClose={closeDialog}
+      onBindEmail={() => setDialog('bind')}
+      onReset={() => {
+        closeDialog()
+        setStatus('密码已重置，所有设备已下线，请使用新密码登录')
+      }}
+    />}
+  </div>
 }

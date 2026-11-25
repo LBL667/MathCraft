@@ -102,10 +102,87 @@ input[type="number"] {
   appearance: textfield;
 }
 
-/* KaTeX 公式与正文对齐 */
+/* KaTeX 公式与正文对齐：默认字号与正文一致，避免公式在题干选项中视觉突出 */
 .katex {
-  font-size: 1.1em;
+  font-size: 1em;
 }
 .katex-display {
   margin: 0.2em 0;
+}
+
+/* 限宽横滚仅作用于 AI 对话区的助手回复（chat-answer），题目预览等界面保持公式默认渲染 */
+.chat-answer .katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+  max-width: 100%;
+}
+.chat-answer .katex-display > .katex {
+  display: inline-block;
+  white-space: nowrap;
+  max-width: none;
+}
+.chat-answer .katex {
+  display: inline-block;
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.2em 0;
+  vertical-align: baseline;
+}
+
+/* 工作台窄屏：导航、对话和历史侧栏纵向排列。 */
+@media (max-width: 767px) {
+  .workspace-shell {
+    height: auto;
+    min-height: 100dvh;
+  }
+  .workspace-topbar {
+    height: auto;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 12px;
+  }
+  .workspace-topbar > div:last-of-type {
+    min-width: 0;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .workspace-topbar button[title="进入个人中心"] {
+    min-width: 0;
+    flex-wrap: wrap;
+  }
+  .workspace-topbar button[title="进入个人中心"] > span {
+    overflow-wrap: anywhere;
+  }
+  .workspace-body {
+    flex-direction: column;
+  }
+  .workspace-body > nav {
+    width: auto;
+    border-right: 0;
+  }
+  .workspace-body > nav > ul {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 4px;
+  }
+  .workspace-body > nav > ul button {
+    flex-direction: column;
+    gap: 4px;
+    padding: 8px 0;
+  }
+  .workspace-body > main {
+    flex: none;
+    min-height: 640px;
+    margin: 8px;
+  }
+  .workspace-tabs {
+    flex-wrap: wrap;
+    gap: 12px;
+    padding-inline: 12px;
+  }
+  .workspace-body > aside {
+    width: auto !important;
+    margin: 8px;
+  }
 }

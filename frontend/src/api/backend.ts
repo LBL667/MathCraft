@@ -1,7 +1,10 @@
 /** 真实后端 API 层：统一封装 fetch、token、字段映射。 */
 import type {
   AssembleRecord,
+  ChatMode,
+  ChatReply,
   Difficulty,
+  DocumentStatus,
   ExamWindow,
   FavoriteGroup,
   KbDocument,
@@ -14,43 +17,11 @@ import type {
   TeacherProfile,
 } from '../types'
 
-let apiToken = ''
-
-export function setApiToken(token: string | null) {
-  apiToken = token ?? ''
-}
-
-export class ApiError extends Error {
-  code: string
-  constructor(message: string, code = 'REQUEST_FAILED') {
-    super(message)
-    this.code = code
-  }
-}
-
-async function parseError(resp: Response): Promise<ApiError> {
-  try {
-    const body = await resp.json()
-    const detail = body?.detail
-    if (typeof detail === 'string') return new ApiError(detail)
-    if (detail && typeof detail === 'object') {
-      return new ApiError(String(detail.message ?? `HTTP ${resp.status}`), String(detail.code ?? 'REQUEST_FAILED'))
-    }
-    return new ApiError(`HTTP ${resp.status}`)
-  } catch {
-    return new ApiError(`HTTP ${resp.status}`)
-  }
-}
-
-export async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const headers = new Headers(init.headers)
-  headers.set('Content-Type', 'application/json')
-  if (apiToken) headers.set('Authorization', `Bearer ${apiToken}`)
-  const resp = await fetch(path, { ...init, headers })
-  if (!resp.ok) throw await parseError(resp)
-  if (resp.status === 204) return undefined as T
-  return (await resp.json()) as T
-}
+import { apiUrl } from './urls'
+import { downloadDocument as downloadPreviewDocument, fetchDocumentText as fetchPreviewText, openPdfDocument as openPdfPreview } from './documentPreview'
+import type { TextDocumentFormat } from './documentPreview'
+import { ApiError, authenticatedOperation, request } from './session'
+export { ApiError, request, setApiToken } from './session'
 
 export function fileUrl(path: string): string {
   return path
@@ -58,7 +29,7 @@ export function fileUrl(path: string): string {
 
 /* ---------------- 认证 ---------------- */
 
-export type AuthRole = 'student' | 'teacher'
+export type AuthRole = 'student' | 'teacher' | 'admin'
 
 export interface ApiUser {
   id: string
@@ -66,16 +37,19 @@ export interface ApiUser {
   role: AuthRole
   identity: string
   display_name: string
+  password_change_recommended?: boolean
   gender?: string | null
   phone?: string | null
   email?: string | null
+  email_verified: boolean
   user_no?: string | null
   school?: string | null
   avatar_url?: string | null
 }
 
 export interface LoginResult {
-  token: string
+  access_token: string
+  token_type: string
   expires_in: number
   user: ApiUser
 }
@@ -87,12 +61,14 @@ export interface AuthUser {
   identity: string
   token: string
   userId: string
+  passwordChangeRecommended: boolean
   avatarUrl?: string
   userNo?: string
   school?: string
   gender?: string
   phone?: string
   email?: string
+  emailVerified: boolean
 }
 
 export function mapAuthUser(user: ApiUser, token: string): AuthUser {
@@ -103,56 +79,67 @@ export function mapAuthUser(user: ApiUser, token: string): AuthUser {
     identity: user.identity,
     token,
     userId: user.id,
+    passwordChangeRecommended: user.password_change_recommended ?? false,
     avatarUrl: user.avatar_url ?? undefined,
     userNo: user.user_no ?? undefined,
     school: user.school ?? undefined,
     gender: user.gender ?? undefined,
     phone: user.phone ?? undefined,
     email: user.email ?? undefined,
+    emailVerified: user.email_verified,
   }
 }
 
-export async function login(account: string, password: string, role: AuthRole): Promise<AuthUser> {
-  const body = await request<LoginResult>('/api/auth/login', {
-    method: 'POST',
-    body: JSON.stringify({ account, password, role }),
-  })
-  return mapAuthUser(body.user, body.token)
+/* ---------------- 平台管理员 ---------------- */
+
+export interface AdminAccount {
+  id: string
+  account: string
+  display_name: string
+  role: AuthRole
+  identity: string
+  status: 'active' | 'disabled'
+  created_at: string
 }
 
-export async function fetchAuthUser(token: string): Promise<AuthUser | null> {
-  setApiToken(token)
-  try {
-    const body = await request<{ user: ApiUser }>('/api/auth/me')
-    return mapAuthUser(body.user, token)
-  } catch {
-    setApiToken(null)
-    return null
-  }
+export interface PlatformOverview {
+  admin_contact: string
+  accounts: Record<string, number>
+  resources: Record<string, number>
+  task_total: number
+  task_scope: string
+  task_status_counts: Record<string, number>
+  tasks: Array<{ id: string; type: string; status: string; created_at: string; completed_at: string | null }>
 }
 
-export async function logout(): Promise<void> {
-  await request<void>('/api/auth/logout', { method: 'POST' }).catch(() => undefined)
-  setApiToken(null)
+export function listAdminAccounts(
+  query = '', role?: AuthRole, status?: 'active' | 'disabled', signal?: AbortSignal,
+) {
+  const params = new URLSearchParams()
+  if (query) params.set('query', query)
+  if (role) params.set('role', role)
+  if (status) params.set('status', status)
+  return request<AdminAccount[]>('/api/admin/accounts?' + params.toString(), { signal })
 }
 
-export async function changePasswordPublic(
-  account: string,
-  oldPassword: string,
-  newPassword: string,
-  role: AuthRole,
-): Promise<void> {
-  await request<void>('/api/auth/change-password', {
-    method: 'POST',
-    body: JSON.stringify({ account, old_password: oldPassword, new_password: newPassword, role }),
-  })
+export function createAdminAccount(body: { account: string; display_name: string; role: AuthRole; password: string }) {
+  return request<AdminAccount>('/api/admin/accounts', { method: 'POST', body: JSON.stringify(body) })
 }
 
-export async function changePasswordLoggedIn(oldPassword: string, newPassword: string): Promise<void> {
-  await request<void>('/api/auth/password', {
-    method: 'PUT',
-    body: JSON.stringify({ old_password: oldPassword, new_password: newPassword }),
-  })
+export function updateAdminAccount(userId: string, displayName: string) {
+  return request<AdminAccount>('/api/admin/accounts/' + userId, { method: 'PATCH', body: JSON.stringify({ display_name: displayName }) })
+}
+
+export function resetAdminPassword(userId: string, password: string) {
+  return request<void>('/api/admin/accounts/' + userId + '/reset-password', { method: 'POST', body: JSON.stringify({ password }) })
+}
+
+export function setAdminAccountStatus(userId: string, action: 'disable' | 'restore') {
+  return request<void>('/api/admin/accounts/' + userId + '/' + action, { method: 'POST' })
+}
+
+export function fetchPlatformOverview(signal?: AbortSignal) {
+  return request<PlatformOverview>('/api/admin/overview', { signal })
 }
 
 /* ---------------- 题库 ---------------- */
@@ -164,6 +151,9 @@ export interface ApiBankCreator {
 
 export interface ApiBank {
   id: string
+  status: 'active' | 'deleting'
+  stage?: string | null
+  error_message?: string | null
   name: string
   code: string
   creator: ApiBankCreator | null
@@ -171,8 +161,7 @@ export interface ApiBank {
   capacity: number
   source: 'owned' | 'joined'
   quitted: boolean
-  my_role: 'owner' | 'admin' | 'member'
-  my_admin_level: 'super' | 'normal'
+  my_role: 'creator' | 'editor' | 'readonly'
   can_upload_document: boolean
   can_download_document: boolean
   can_delete_document: boolean
@@ -185,15 +174,30 @@ export interface ApiBank {
 export interface ApiBankMember {
   id: string
   user: { id: string; display_name: string; account: string }
-  role: 'owner' | 'admin' | 'member'
-  is_admin: boolean
-  admin_level: 'super' | 'normal' | null
+  role: 'creator' | 'editor' | 'readonly'
   is_creator: boolean
   is_me: boolean
   joined_at: string
 }
 
-export type AdminLevel = 'normal' | 'super'
+function isRecord(value: unknown): value is Record<PropertyKey, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function isApiBank(value: unknown): value is ApiBank {
+  return isRecord(value)
+    && typeof value.id === 'string' && typeof value.name === 'string'
+    && (value.status === 'active' || value.status === 'deleting')
+    && typeof value.code === 'string' && typeof value.member_count === 'number'
+    && typeof value.capacity === 'number' && typeof value.quitted === 'boolean'
+    && (value.source === 'owned' || value.source === 'joined')
+    && (value.my_role === 'creator' || value.my_role === 'editor' || value.my_role === 'readonly')
+    && (value.creator === null || (isRecord(value.creator)
+      && typeof value.creator.id === 'string' && typeof value.creator.display_name === 'string'))
+    && ['can_upload_document', 'can_download_document', 'can_delete_document',
+      'can_manage_members', 'can_edit_bank', 'can_transfer_bank', 'can_delete_bank']
+      .every((key) => typeof value[key] === 'boolean')
+}
 
 export async function listBanks(scope: 'owned' | 'joined' | 'all' = 'all'): Promise<ApiBank[]> {
   return request<ApiBank[]>(`/api/banks?scope=${scope}`)
@@ -209,7 +213,7 @@ export async function getBank(id: string): Promise<ApiBank> {
 
 export async function updateBank(
   id: string,
-  patch: { name?: string; admin_level?: AdminLevel },
+  patch: { name?: string },
 ): Promise<ApiBank> {
   return request<ApiBank>(`/api/banks/${id}`, { method: 'PUT', body: JSON.stringify(patch) })
 }
@@ -226,6 +230,10 @@ export async function quitBank(id: string): Promise<void> {
   await request<void>(`/api/banks/${id}/quit`, { method: 'POST' })
 }
 
+export async function addBankMember(bankId: string, account: string, role: 'editor' | 'readonly'): Promise<ApiBankMember> {
+  return request<ApiBankMember>(`/api/banks/${bankId}/members`, { method: 'POST', body: JSON.stringify({ account, role }) })
+}
+
 export async function listBankMembers(id: string): Promise<ApiBankMember[]> {
   return request<ApiBankMember[]>(`/api/banks/${id}/members`)
 }
@@ -233,7 +241,7 @@ export async function listBankMembers(id: string): Promise<ApiBankMember[]> {
 export async function setBankMemberRole(
   bankId: string,
   userId: string,
-  role: 'admin' | 'member',
+  role: 'editor' | 'readonly',
 ): Promise<void> {
   await request<void>(`/api/banks/${bankId}/members/${userId}/role`, {
     method: 'PUT',
@@ -262,7 +270,7 @@ export interface ApiDocument {
   size_bytes: number
   page_count?: number | null
   is_scanned: boolean
-  status: 'uploaded' | 'parsing' | 'ocr' | 'chunking' | 'embedding' | 'ready' | 'failed'
+  status: DocumentStatus
   stage?: string | null
   progress: number
   chunk_count: number
@@ -278,43 +286,67 @@ export function formatFileSize(bytes: number): string {
 }
 
 export function mapDocument(doc: ApiDocument): KbDocument & { api: ApiDocument } {
-  return { id: doc.id, kbId: doc.bank_id, name: doc.name, api: doc }
+  return { id: doc.id, kbId: doc.bank_id, name: doc.name,
+    status: doc.status, stage: doc.stage, progress: doc.progress, api: doc }
 }
 
-export async function listDocuments(bankId: string): Promise<ApiDocument[]> {
-  return request<ApiDocument[]>(`/api/banks/${bankId}/documents`)
+export async function listDocuments(bankId: string, signal?: AbortSignal): Promise<ApiDocument[]> {
+  return request<ApiDocument[]>(`/api/banks/${bankId}/documents`, { signal })
 }
 
 export async function getDocument(bankId: string, docId: string): Promise<ApiDocument> {
   return request<ApiDocument>(`/api/banks/${bankId}/documents/${docId}`)
 }
 
-export function uploadDocument(
+export async function uploadDocument(
   bankId: string,
   file: File,
   onUploadProgress?: (percent: number) => void,
-): Promise<{ document_id: string; status: string; stage: string; progress: number }> {
-  return new Promise((resolve, reject) => {
+): Promise<{ document_id: string; status: string; stage: string; progress: number; eta_minutes?: number }> {
+  return authenticatedOperation((token) => new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest()
-    xhr.open('POST', `/api/banks/${bankId}/documents`)
-    if (apiToken) xhr.setRequestHeader('Authorization', `Bearer ${apiToken}`)
+    xhr.open('POST', apiUrl(`/api/banks/${bankId}/documents`))
+    xhr.withCredentials = true
+    xhr.setRequestHeader('Authorization', `Bearer ${token}`)
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable && onUploadProgress) onUploadProgress(Math.round((e.loaded / e.total) * 100))
     }
-    xhr.onerror = () => reject(new ApiError('上传失败，请检查后端服务'))
+    xhr.onerror = () => reject(new ApiError('上传失败，请检查后端服务', 'REQUEST_FAILED', xhr.status))
     xhr.onload = () => {
       try {
-        const body = JSON.parse(xhr.responseText || '{}')
-        if (xhr.status >= 200 && xhr.status < 300) resolve(body)
-        else reject(new ApiError(body?.detail?.message ?? `HTTP ${xhr.status}`, body?.detail?.code))
+        const body: unknown = JSON.parse(xhr.responseText || '{}')
+        if (body !== null && typeof body === 'object' && !Array.isArray(body)) {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            if ('document_id' in body && typeof body.document_id === 'string'
+              && 'status' in body && typeof body.status === 'string'
+              && 'stage' in body && typeof body.stage === 'string'
+              && 'progress' in body && typeof body.progress === 'number'
+              && (!('eta_minutes' in body) || typeof body.eta_minutes === 'number')) {
+              resolve({ document_id: body.document_id, status: body.status,
+                stage: body.stage, progress: body.progress,
+                ...('eta_minutes' in body && typeof body.eta_minutes === 'number'
+                  ? { eta_minutes: body.eta_minutes } : {}) })
+              return
+            }
+          } else if ('detail' in body && body.detail !== null && typeof body.detail === 'object') {
+            const detail = body.detail
+            const message = 'message' in detail && typeof detail.message === 'string'
+              ? detail.message : `HTTP ${xhr.status}`
+            const code = 'code' in detail && typeof detail.code === 'string'
+              ? detail.code : 'REQUEST_FAILED'
+            reject(new ApiError(message, code, xhr.status))
+            return
+          }
+        }
+        reject(new ApiError(`HTTP ${xhr.status}`, 'REQUEST_FAILED', xhr.status))
       } catch {
-        reject(new ApiError(`HTTP ${xhr.status}`))
+        reject(new ApiError(`HTTP ${xhr.status}`, 'REQUEST_FAILED', xhr.status))
       }
     }
     const form = new FormData()
     form.append('file', file)
     xhr.send(form)
-  })
+  }))
 }
 
 export async function reprocessDocument(bankId: string, docId: string): Promise<void> {
@@ -325,25 +357,30 @@ export async function deleteDocument(bankId: string, docId: string): Promise<voi
   await request<void>(`/api/banks/${bankId}/documents/${docId}`, { method: 'DELETE' })
 }
 
-export async function downloadDocument(bankId: string, docId: string, name: string): Promise<void> {
-  const headers: HeadersInit = {}
-  if (apiToken) (headers as Record<string, string>).Authorization = `Bearer ${apiToken}`
-  const resp = await fetch(`/api/banks/${bankId}/documents/${docId}/download`, { headers })
-  if (!resp.ok) throw await parseError(resp)
-  const blob = await resp.blob()
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = name
-  document.body.appendChild(a)
-  a.click()
-  a.remove()
-  URL.revokeObjectURL(url)
+/** 文档下载，支持预览生命周期取消。 */
+export async function downloadDocument(bankId: string, docId: string, name: string, signal?: AbortSignal): Promise<void> {
+  await downloadPreviewDocument(bankId, docId, name, signal)
+}
+
+/** UTF-8 文本限 2 MiB、60 秒，默认 MD 兼容旧入口。 */
+export async function fetchDocumentText(bankId: string, docId: string, signal?: AbortSignal, docFormat: TextDocumentFormat = 'MD'): Promise<string> {
+  return fetchPreviewText(bankId, docId, signal, docFormat)
+}
+
+/** 点击时同步预开 PDF 窗口，随后携带认证请求 Blob。 */
+export async function openPdfDocument(bankId: string, docId: string): Promise<void> {
+  return openPdfPreview(bankId, docId)
+}
+
+/** 兼容旧 PDF 查看入口。 */
+export async function viewDocument(bankId: string, docId: string): Promise<void> {
+  return openPdfPreview(bankId, docId)
 }
 
 /* ---------------- 出题与题目 ---------------- */
 
 export interface GenerateBody {
+  request_id?: string
   bank_id: string
   document_id: string
   types: { type: QuestionType; count: number }[]
@@ -360,6 +397,18 @@ export interface ApiQuestion {
   type: QuestionType
   score: number
   difficulty: Difficulty
+  /** 盲评加权总分 1~5，0 表示未评估（列表接口用 snake_case，出题结果用 camelCase） */
+  difficulty_score?: number
+  difficultyScore?: number
+  /** 盲评明细：各维分、判定档与缺陷码 */
+  difficulty_review?: {
+    total?: number
+    tier?: string
+    scores?: Record<string, number>
+    defectCodes?: string[]
+    suggestion?: string
+    passed?: boolean
+  } | null
   stem: string
   options: OptionItem[]
   answer?: string
@@ -377,9 +426,12 @@ export interface ApiQuestion {
 export function mapQuestion(q: ApiQuestion): Question {
   return {
     id: q.paper_question_id ?? q.id,
+    no: q.no,
     type: q.type,
     score: q.score,
     difficulty: q.difficulty,
+    difficultyScore: q.difficulty_score ?? q.difficultyScore ?? 0,
+    difficultyReview: q.difficulty_review ?? undefined,
     stem: q.stem,
     options: q.options ?? [],
     answer: q.answer ?? '',
@@ -399,11 +451,16 @@ export async function startGeneration(body: GenerateBody): Promise<{ task_id: st
 }
 
 export interface GenerateProgress {
+  status: 'queued' | 'running' | 'canceling' | 'canceled' | 'done' | 'failed' | 'interrupted'
+  execution_finished: boolean
+  question_ids?: string[]
   progress: number
   stage: string
   done: boolean
   batch_id: string | null
   questions: ApiQuestion[]
+  /** 出题中间件的处理统计：去重、重出、补解析的题数 */
+  review?: { duplicates: number; repaired?: number; regenerated: number; solved: number } | null
   error: { message?: string; kind?: string; available?: number; requested?: number } | null
 }
 
@@ -411,14 +468,23 @@ export async function getGenerationProgress(taskId: string): Promise<GeneratePro
   return request<GenerateProgress>(`/api/generate/progress/${taskId}`)
 }
 
+export async function findGenerationRequest(requestId: string): Promise<{ task_id: string }> {
+  return request(`/api/generate/requests/${requestId}`)
+}
+
+export async function cancelGeneration(taskId: string): Promise<GenerateProgress & { question_ids: string[] }> {
+  return request(`/api/generate/cancel/${taskId}`, { method: 'POST' })
+}
+
 export async function latestBatch(
   bankId?: string,
   documentId?: string,
+  signal?: AbortSignal,
 ): Promise<{ batch_id: string | null; questions: ApiQuestion[] }> {
   const params = new URLSearchParams()
   if (bankId) params.set('bank_id', bankId)
   if (documentId) params.set('document_id', documentId)
-  return request(`/api/generate/batches/latest?${params.toString()}`)
+  return request(`/api/generate/batches/latest?${params.toString()}`, { signal })
 }
 
 export async function listQuestions(params: {
@@ -427,12 +493,12 @@ export async function listQuestions(params: {
   document_id?: string
   page?: number
   page_size?: number
-}): Promise<{ items: ApiQuestion[]; total: number }> {
+}, signal?: AbortSignal): Promise<{ items: ApiQuestion[]; total: number }> {
   const search = new URLSearchParams()
   Object.entries(params).forEach(([k, v]) => {
     if (v !== undefined && v !== '') search.set(k, String(v))
   })
-  return request(`/api/questions?${search.toString()}`)
+  return request(`/api/questions?${search.toString()}`, { signal })
 }
 
 export async function updateQuestionApi(q: Question): Promise<ApiQuestion> {
@@ -588,12 +654,14 @@ export async function removeSpaceMember(spaceId: string, userId: string): Promis
 /** 空间内发布的试卷（学生作答入口；与组卷记录严格隔离） */
 export interface ApiSpacePaper {
   id: string
+  closed: boolean
+  deleted: boolean
   name: string
   created_at: string
   question_count: number
   total_score: number
   status: string
-  exam_window: { start: string; end: string } | null
+  exam_window: { start: string | null; end: string | null } | null
   stopped: boolean
   submitted_count: number
   student_count: number
@@ -651,6 +719,8 @@ export interface ApiPaperSpace {
 
 export interface ApiPaper {
   id: string
+  closed: boolean
+  deleted: boolean
   name: string
   owner_id: string
   created_at: string
@@ -661,7 +731,7 @@ export interface ApiPaper {
   saved_to_records: boolean
   allow_review: boolean
   allow_retake: boolean
-  exam_window: { start: string; end: string } | null
+  exam_window: { start: string | null; end: string | null } | null
   spaces: ApiPaperSpace[]
   submitted_count: number
   student_count: number
@@ -690,11 +760,14 @@ export function toIso(value?: string | null): string | null {
 export function mapPaper(p: ApiPaper): AssembleRecord {
   return {
     id: p.id,
+    closed: p.closed,
+    deleted: p.deleted,
     name: p.name,
     createdAt: formatDateTime(p.created_at),
     questionCount: p.question_count,
     totalScore: p.total_score,
     spaces: p.spaces.map((s) => s.name),
+    publications: p.spaces.map((s) => ({ spaceId: s.space_id, stopped: s.stopped })),
     published: p.status === 'published',
     questions: p.questions?.map(mapQuestion),
     examWindow: p.exam_window
@@ -737,10 +810,12 @@ function paperBody(payload: PaperCreatePayload) {
 
 export async function listPapers(params: {
   include_drafts?: boolean
+  include_history?: boolean
   saved?: boolean
   space_id?: string
 } = {}): Promise<ApiPaper[]> {
   const search = new URLSearchParams()
+  search.set('include_history', String(params.include_history ?? true))
   if (params.include_drafts !== undefined) search.set('include_drafts', String(params.include_drafts))
   if (params.saved !== undefined) search.set('saved', String(params.saved))
   if (params.space_id) search.set('space_id', params.space_id)
@@ -751,8 +826,16 @@ export async function createPaperApi(payload: PaperCreatePayload): Promise<ApiPa
   return request<ApiPaper>('/api/papers', { method: 'POST', body: JSON.stringify(paperBody(payload)) })
 }
 
-export async function getPaperApi(id: string): Promise<ApiPaper> {
-  return request<ApiPaper>(`/api/papers/${id}`)
+export async function getPaperApi(id: string, history = false): Promise<ApiPaper> {
+  return request<ApiPaper>(`/api/papers/${id}${history ? '?history=true' : ''}`)
+}
+
+export async function closePaperApi(id: string): Promise<ApiPaper> {
+  return request<ApiPaper>(`/api/papers/${id}/close`, { method: 'POST' })
+}
+
+export async function reopenPaperApi(id: string): Promise<ApiPaper> {
+  return request<ApiPaper>(`/api/papers/${id}/reopen`, { method: 'POST' })
 }
 
 export async function updatePaperApi(
@@ -843,19 +926,36 @@ export async function getStatistics(paperId: string, spaceId: string): Promise<A
 
 export interface ApiAttempt {
   id: string
-  status: 'answering' | 'submitted'
+  status: 'answering' | 'grading' | 'submitted'
   score: number | null
   total_score: number
   started_at: string
   submitted_at: string | null
 }
 
+export interface ApiAttemptQuestion {
+  paper_question_id: string
+  no: number
+  type: QuestionType
+  score: number
+  difficulty: Difficulty
+  stem: string
+  options: OptionItem[]
+  knowledge_point: string
+  answer?: string
+  analysis?: string
+}
+
+export function mapAttemptQuestion(question: ApiAttemptQuestion): Question {
+  return mapQuestion({ ...question, id: question.paper_question_id })
+}
+
 export interface ApiAttemptPayload {
-  paper: { id: string; name: string; total_score: number; allow_review: boolean; allow_retake: boolean; exam_window: { start: string; end: string } | null; stopped: boolean }
+  paper: { id: string; name: string; total_score: number; allow_review: boolean; allow_retake: boolean; exam_window: { start: string | null; end: string | null } | null; stopped: boolean; closed: boolean; deleted: boolean }
   space: { id: string; name: string } | null
-  questions: ApiQuestion[]
+  questions: ApiAttemptQuestion[]
   attempt: ApiAttempt | null
-  answers: { paper_question_id: string; choices: string[]; text: string; score: number; is_correct: boolean; grading_note?: string | null }[]
+  answers: { paper_question_id: string; choices: string[]; text: string; score: number; is_correct: boolean; grading_note: string | null }[]
 }
 
 export async function getAttempt(paperId: string, spaceId?: string | null): Promise<ApiAttemptPayload> {
@@ -873,7 +973,7 @@ export async function createAttempt(paperId: string, spaceId?: string | null): P
 export async function submitAttempt(
   attemptId: string,
   answers: { paper_question_id: string; choices: string[]; text: string }[],
-): Promise<{ attempt_id: string; score: number; total_score: number; detail: { paper_question_id: string; score: number; is_correct: boolean; answer: string; analysis: string }[] }> {
+): Promise<{ attempt_id: string; score: number; total_score: number; detail: { paper_question_id: string; score: number; is_correct: boolean; answer?: string; analysis?: string }[] }> {
   return request(`/api/attempts/${attemptId}/submit`, {
     method: 'POST',
     body: JSON.stringify({ answers }),
@@ -887,16 +987,12 @@ export async function reviewAttempt(attemptId: string): Promise<ApiAttemptPayloa
 /* ---------------- 个人资料与模型配置 ---------------- */
 
 export async function updateProfile(patch: Partial<TeacherProfile> & { school?: string }): Promise<ApiUser> {
-  return request<ApiUser>('/api/users/me', {
-    method: 'PUT',
-    body: JSON.stringify({
-      display_name: patch.name,
-      gender: patch.gender,
-      phone: patch.phone,
-      email: patch.email,
-      school: patch.school,
-    }),
-  })
+  const body: Record<string, unknown> = {}
+  if (patch.name !== undefined) body.display_name = patch.name
+  if (patch.gender !== undefined) body.gender = patch.gender === '' ? null : patch.gender
+  if (patch.phone !== undefined) body.phone = patch.phone === '' ? null : patch.phone
+  if (patch.school !== undefined) body.school = patch.school
+  return request<ApiUser>('/api/users/me', { method: 'PUT', body: JSON.stringify(body) })
 }
 
 export interface ModelSettings {
@@ -928,12 +1024,18 @@ export async function saveModelSettings(payload: {
   })
 }
 
-export async function testDeepSeek(): Promise<void> {
-  await request<void>('/api/users/me/model-settings/test-deepseek', { method: 'POST' })
+export async function testDeepSeek(key?: string): Promise<void> {
+  await request<void>('/api/users/me/model-settings/test-deepseek', {
+    method: 'POST',
+    body: JSON.stringify(key ? { deepseek_api_key: key } : {}),
+  })
 }
 
-export async function testMinerU(): Promise<void> {
-  await request<void>('/api/users/me/model-settings/test-mineru', { method: 'POST' })
+export async function testMinerU(token?: string): Promise<void> {
+  await request<void>('/api/users/me/model-settings/test-mineru', {
+    method: 'POST',
+    body: JSON.stringify(token ? { mineru_token: token } : {}),
+  })
 }
 
 /* ---------------- 对话出题 ---------------- */
@@ -945,30 +1047,190 @@ export interface ChatSession {
   welcome?: string
 }
 
-export async function createChatSession(bankId: string, documentId: string): Promise<ChatSession> {
+/** 历史会话列表项：标题取首条用户消息，按账号隔离 */
+export interface ApiChatSessionSummary {
+  session_id: string
+  title: string
+  bank_id: string
+  document_id: string
+  document_name?: string | null
+  last_message_at?: string | null
+  created_at?: string | null
+}
+
+export async function listChatSessions(): Promise<ApiChatSessionSummary[]> {
+  const data = await request<{ items: ApiChatSessionSummary[] }>('/api/chat/sessions')
+  return data.items
+}
+
+export interface ApiChatMessage {
+  id: string
+  role: 'user' | 'assistant'
+  text: string
+  batch_id?: string | null
+  created_at?: string
+}
+
+export interface BackendChatDetail {
+  mode: ChatMode
+  messages: ApiChatMessage[]
+}
+
+export async function getChatSession(sessionId: string, signal?: AbortSignal): Promise<BackendChatDetail> {
+  return request(`/api/chat/sessions/${sessionId}`, { signal })
+}
+
+export async function createChatSession(bankId: string, documentId: string, signal?: AbortSignal): Promise<ChatSession> {
   return request<ChatSession>('/api/chat/sessions', {
     method: 'POST',
     body: JSON.stringify({ bank_id: bankId, document_id: documentId }),
+    signal,
   })
 }
 
-export async function getChatSession(sessionId: string): Promise<{ messages: { role: 'user' | 'assistant'; text: string }[] }> {
-  return request(`/api/chat/sessions/${sessionId}`)
+export type ChatMessageResult = Omit<ChatReply, 'questions'> & { questions: ApiQuestion[] }
+
+export interface ChatTurnStatus {
+  status: 'running' | 'canceled' | 'done' | 'failed' | 'interrupted'
+  execution_finished: boolean
+  batch_id: string | null
+  result: ChatMessageResult | null
 }
 
 export async function sendChatMessage(
   sessionId: string,
   message: string,
   existingStems: string[],
-): Promise<{ reply: string; questions: ApiQuestion[]; done: boolean; batch_id: string | null; slot_state: Record<string, unknown> }> {
+  signal?: AbortSignal,
+  images: string[] = [],
+  mode: ChatMode = 'generate',
+  switchOnly = false,
+  requestId?: string,
+): Promise<ChatMessageResult> {
   return request(`/api/chat/sessions/${sessionId}/messages`, {
     method: 'POST',
-    body: JSON.stringify({ message, existing_stems: existingStems }),
+    body: JSON.stringify({
+      message,
+      existing_stems: existingStems,
+      mode,
+      switch_only: switchOnly,
+      request_id: requestId,
+      ...(images.length ? { images } : {}),
+    }),
+    signal,
   })
+}
+
+export async function confirmChat(
+  sessionId: string,
+  confirmId: string,
+  accepted: boolean,
+  signal?: AbortSignal,
+): Promise<{ reply: string; done: boolean }> {
+  return request(`/api/chat/sessions/${sessionId}/confirm`, {
+    method: 'POST',
+    body: JSON.stringify({ confirm_id: confirmId, accepted }),
+    signal,
+  })
+}
+
+export async function getChatProgress(
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<{ active: boolean; percent: number; stage: string }> {
+  return request(`/api/chat/sessions/${sessionId}/progress`, { signal })
+}
+
+export async function cancelChat(sessionId: string, requestId: string, signal: AbortSignal): Promise<ChatTurnStatus> {
+  return request(`/api/chat/sessions/${sessionId}/cancel?request_id=${encodeURIComponent(requestId)}`, {
+    method: 'POST', signal,
+  })
+}
+
+export async function getChatTurn(sessionId: string, requestId: string, signal: AbortSignal): Promise<ChatTurnStatus> {
+  return request(`/api/chat/sessions/${sessionId}/requests/${encodeURIComponent(requestId)}`, { signal })
 }
 
 export async function deleteChatSession(sessionId: string): Promise<void> {
   await request<void>(`/api/chat/sessions/${sessionId}`, { method: 'DELETE' })
+}
+
+/* ---------------- 站内通知 ---------------- */
+
+export interface ApiNotification {
+  id: string
+  kind: 'bank_ready' | 'bank_failed'
+  title: string
+  body: string
+  bank_id?: string | null
+  document_name?: string | null
+  read: boolean
+  created_at: string
+}
+
+export async function listNotifications(): Promise<{ unread_count: number; items: ApiNotification[] }> {
+  return request('/api/notifications')
+}
+
+export async function markNotificationsRead(ids?: string[]): Promise<void> {
+  await request('/api/notifications/read', {
+    method: 'POST',
+    body: JSON.stringify({ ids: ids && ids.length ? ids : null }),
+  })
+}
+
+export async function deleteNotification(id: string): Promise<void> {
+  await request<void>(`/api/notifications/${id}`, { method: 'DELETE' })
+}
+
+/** 新建题库并上传首个文档：一次请求完成创建+上传，返回预计等待分钟数 */
+export async function createBankWithDocument(
+  name: string,
+  file: File,
+  onUploadProgress?: (percent: number) => void,
+): Promise<{
+  bank: ApiBank
+  document: { document_id: string; name: string; eta_minutes: number; status: string }
+}> {
+  return authenticatedOperation((token) => new Promise((resolve, reject) => {
+    const form = new FormData()
+    form.append('name', name)
+    form.append('file', file)
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', apiUrl('/api/banks/with-document'))
+    xhr.withCredentials = true
+    xhr.setRequestHeader('Authorization', `Bearer ${token}`)
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable && onUploadProgress) onUploadProgress(Math.round((e.loaded / e.total) * 100))
+    }
+    xhr.onerror = () => reject(new ApiError('创建失败，请检查后端服务', 'REQUEST_FAILED', xhr.status))
+    xhr.onload = () => {
+      try {
+        const body: unknown = JSON.parse(xhr.responseText || '{}')
+        if (isRecord(body)) {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            const doc = body.document
+            if (isApiBank(body.bank) && isRecord(doc)
+              && typeof doc.document_id === 'string' && typeof doc.name === 'string'
+              && typeof doc.eta_minutes === 'number' && typeof doc.status === 'string') {
+              resolve({ bank: body.bank, document: { document_id: doc.document_id,
+                name: doc.name, eta_minutes: doc.eta_minutes, status: doc.status } })
+              return
+            }
+          } else if (isRecord(body.detail)) {
+            const { code, message } = body.detail
+            reject(new ApiError(typeof message === 'string' ? message : '创建题库失败',
+              typeof code === 'string' ? code : 'REQUEST_FAILED', xhr.status))
+            return
+          }
+        }
+        reject(new ApiError('创建题库失败', 'REQUEST_FAILED', xhr.status))
+      } catch {
+        reject(new ApiError('创建题库失败', 'REQUEST_FAILED', xhr.status))
+      }
+    }
+    xhr.send(form)
+  }))
 }
 
 /* ---------------- 通用映射 ---------------- */

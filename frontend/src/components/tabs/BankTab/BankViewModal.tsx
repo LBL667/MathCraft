@@ -1,10 +1,9 @@
-/** 题库查看弹窗：浏览信息与成员；上传需管理员，删除文档需超级管理员，文档可下载 */
-import { useRef, useState } from 'react'
-import type { DragEvent } from 'react'
+/** 题库查看弹窗：浏览信息、成员权限和文档操作。 */
+import { useEffect, useRef, useState } from 'react'
 import {
   Ban,
-  Crown,
   Download,
+  Eye,
   FileUp,
   FolderOpen,
   Lock,
@@ -13,10 +12,14 @@ import {
   X,
 } from 'lucide-react'
 import * as bankApi from '../../../api/banks'
-import type { ManagedBank } from '../../../api/banks'
+import type { BankDoc, ManagedBank } from '../../../api/banks'
+import { openPdfDocument } from '../../../api/documentPreview'
+import { assertCurrentSession, getSessionGeneration } from '../../../api/session'
 import { useApp } from '../../../store/AppContext'
-import { Avatar, FormatBadge, SectionTitle } from './shared'
+import { Avatar, DocumentDropZone, DocumentFailure, FormatBadge, SectionTitle } from './shared'
 import { useDocUpload } from './useDocUpload'
+import { useDocDeletion } from './useDocDeletion'
+import DocPreviewModal from './DocPreviewModal'
 
 export default function BankViewModal({
   bank,
@@ -25,29 +28,52 @@ export default function BankViewModal({
 }: {
   bank: ManagedBank
   onClose: () => void
-  onChanged: () => void
+  onChanged: (deletedDocumentId?: string) => void
 }) {
   const { showToast } = useApp()
   const [docs, setDocs] = useState(bank.docs)
-  const [dragOver, setDragOver] = useState(false)
-  const fileInput = useRef<HTMLInputElement>(null)
-  const isAdmin = bankApi.isMyAdmin(bank)
-  const isSuper = bankApi.isMySuperAdmin(bank)
+  const { remove: removeDoc, pendingIds } = useDocDeletion(bank.id, setDocs, onChanged)
+  const [preview, setPreview] = useState<BankDoc | null>(null)
+  const session = useRef(getSessionGeneration())
+  const roleLabel = bank.myRole === 'creator' ? '创建者' : bank.myRole === 'editor' ? '可编辑' : '只读'
   const canUpload = bank.canUpload
-  const { upload, start } = useDocUpload(bank.id, (doc) => setDocs((prev) => [...prev, doc]), showToast)
+  const { start, busy: uploading } = useDocUpload(bank.id, () => {
+    onChanged()
+    void bankApi.getBankDetail(bank.id).then((fresh) => {
+      assertCurrentSession(session.current)
+      setDocs(fresh.docs)
+    })
+      .catch((err) => showToast(err instanceof Error ? err.message : '刷新文档失败', 'error'))
+  }, showToast)
 
-  const onDrop = (e: DragEvent) => {
-    e.preventDefault()
-    setDragOver(false)
-    if (!canUpload) return
-    const file = e.dataTransfer.files?.[0]
-    if (file) start(file)
+  const processing = docs.some((doc) => doc.status && !['ready', 'failed', 'deleting'].includes(doc.status))
+  useEffect(() => {
+    if (!processing) return
+    const timer = window.setInterval(() => {
+      if (session.current !== getSessionGeneration()) return
+      void bankApi.getBankDetail(bank.id).then((fresh) => {
+        assertCurrentSession(session.current)
+        setDocs(fresh.docs)
+      })
+        .catch((err) => showToast(err instanceof Error ? err.message : '刷新文档失败', 'error'))
+    }, 3000)
+    return () => window.clearInterval(timer)
+  }, [bank.id, processing, showToast])
+
+  const close = () => {
+    if (uploading) {
+      showToast('文档正在批量上传，请等待本批完成后再关闭', 'error')
+      return
+    }
+    onClose()
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-[#0f1b33]/45 p-4" onClick={onClose}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-[#0f1b33]/45 p-4" onClick={close}
+      onKeyDown={(event) => { if (event.key === 'Escape') { event.stopPropagation(); close() } }}>
       <div
-        className="flex max-h-[88vh] w-[580px] flex-col overflow-hidden rounded-2xl bg-white shadow-2xl"
+        role="dialog" aria-modal="true" aria-label={`查看题库 · ${bank.name}`} aria-busy={uploading}
+        className="flex max-h-[88vh] w-[580px] max-w-full flex-col overflow-hidden rounded-2xl bg-white shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
         {/* 弹窗头部 */}
@@ -55,15 +81,9 @@ export default function BankViewModal({
           <div className="flex items-center gap-2">
             <FolderOpen size={18} className="text-primary" />
             <h3 className="text-base font-bold text-ink">查看题库 · {bank.name}</h3>
-            {isAdmin ? (
-              <span className="inline-flex items-center gap-0.5 rounded bg-amber-50 px-1.5 py-0.5 text-[10px] font-semibold text-amber-600">
-                <Crown size={10} /> {isSuper ? '超级管理员' : '普通管理员'}
-              </span>
-            ) : (
-              <span className="rounded bg-page px-1.5 py-0.5 text-[10px] text-ink-3">普通成员</span>
-            )}
+            <span className="rounded bg-page px-1.5 py-0.5 text-[10px] font-semibold text-ink-2">{roleLabel}</span>
           </div>
-          <button type="button" onClick={onClose} className="rounded p-1 text-ink-3 transition-colors hover:bg-page hover:text-ink">
+          <button type="button" onClick={close} disabled={uploading} aria-label="关闭查看题库" className="rounded p-1 text-ink-3 transition-colors hover:bg-page hover:text-ink disabled:opacity-50">
             <X size={18} />
           </button>
         </div>
@@ -91,17 +111,21 @@ export default function BankViewModal({
             </div>
           </section>
 
-          {/* 管理员权限说明（只读） */}
+          {/* 成员权限说明（只读） */}
           <section className="space-y-2.5">
-            <SectionTitle icon={ShieldCheck}>管理员权限说明</SectionTitle>
+            <SectionTitle icon={ShieldCheck}>成员权限说明</SectionTitle>
             <div className="space-y-2 rounded-xl border border-line p-3">
-              <div className={`flex items-center justify-between gap-3 rounded-lg px-2.5 py-2 ${bank.adminLevel === 'normal' ? 'bg-primary-light/40' : ''}`}>
-                <span className={`text-sm ${bank.adminLevel === 'normal' ? 'font-semibold text-primary' : 'text-ink'}`}>普通管理员</span>
-                <span className="text-xs text-ink-3">可上传和下载文档</span>
+              <div className="flex items-center justify-between gap-3 rounded-lg px-2.5 py-2">
+                <span className="text-sm text-ink">创建者</span>
+                <span className="text-xs text-ink-3">管理成员、维护资料和删除题库</span>
               </div>
-              <div className={`flex items-center justify-between gap-3 rounded-lg px-2.5 py-2 ${bank.adminLevel === 'super' ? 'bg-primary-light/40' : ''}`}>
-                <span className={`text-sm ${bank.adminLevel === 'super' ? 'font-semibold text-primary' : 'text-ink'}`}>超级管理员</span>
-                <span className="text-xs text-ink-3">可编辑文档，包括删除、上传、下载和查看</span>
+              <div className="flex items-center justify-between gap-3 rounded-lg px-2.5 py-2">
+                <span className="text-sm text-ink">可编辑成员</span>
+                <span className="text-xs text-ink-3">查看、下载、检索、出题、上传和删除资料</span>
+              </div>
+              <div className="flex items-center justify-between gap-3 rounded-lg px-2.5 py-2">
+                <span className="text-sm text-ink">只读成员</span>
+                <span className="text-xs text-ink-3">查看、下载、检索和出题</span>
               </div>
             </div>
           </section>
@@ -115,17 +139,9 @@ export default function BankViewModal({
                   <li key={m.id} className="flex items-center gap-2.5 px-3 py-2.5">
                     <Avatar name={m.name} size="sm" />
                     <span className="text-sm text-ink">{m.name}</span>
-                    {/* 创建者以成员角色为准（转让后自动跟随新 owner） */}
-                    {m.isCreator && (
-                      <span className="inline-flex items-center gap-0.5 rounded bg-primary-light px-1.5 py-0.5 text-[10px] font-semibold text-primary">
-                        <Crown size={10} /> 创建者
-                      </span>
-                    )}
-                    {!m.isCreator && m.isAdmin && (
-                      <span className="inline-flex items-center gap-0.5 rounded bg-amber-50 px-1.5 py-0.5 text-[10px] font-semibold text-amber-600">
-                        {m.adminLevel === 'super' ? '超级管理员' : '普通管理员'}
-                      </span>
-                    )}
+                    <span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${m.isCreator ? 'bg-primary-light text-primary' : m.role === 'editor' ? 'bg-amber-50 text-amber-600' : 'bg-page text-ink-3'}`}>
+                      {m.isCreator ? '创建者' : m.role === 'editor' ? '可编辑' : '只读'}
+                    </span>
                     {m.isMe && (
                       <span className="rounded bg-page px-1.5 py-0.5 text-[10px] text-ink-3">我</span>
                     )}
@@ -140,89 +156,95 @@ export default function BankViewModal({
             <SectionTitle icon={FileUp}>已上传文档（{docs.length}）</SectionTitle>
             {docs.length === 0 && <p className="text-xs text-ink-3">暂无文档</p>}
             <ul className="space-y-1.5">
-              {docs.map((d) => (
-                <li key={d.id} className="flex items-center gap-2.5 rounded-lg border border-line px-3 py-2">
-                  <FormatBadge format={d.format} />
-                  <span className="flex-1 truncate text-sm text-ink">{d.name}</span>
-                  <span className="text-xs text-ink-3">{d.size}</span>
-                  <button
-                    type="button"
-                    title="下载文档"
-                    onClick={() => void bankApi.downloadDoc(bank.id, d.id, d.name).catch((err) => showToast(err instanceof Error ? err.message : '下载失败'))}
-                    className="rounded p-1 text-ink-3 transition-colors hover:bg-primary-light hover:text-primary"
-                  >
-                    <Download size={14} />
-                  </button>
-                  {isSuper && (
+              {docs.map((d) => {
+                const deleting = d.status === 'deleting'
+                const deletingNow = pendingIds.has(d.id)
+                const busy = d.status && !['ready', 'failed', 'deleting'].includes(d.status)
+                const failed = d.status === 'failed'
+                return (
+                  <li key={d.id} className="rounded-lg border border-line px-3 py-2">
+                    <div className="flex items-center gap-2.5">
+                    <FormatBadge format={d.format} />
+                    <span className="flex-1 truncate text-sm text-ink">{d.name}</span>
+                    <span
+                      title={failed ? d.stage ?? '' : undefined}
+                      className={`mr-3 text-xs ${
+                        deleting || deletingNow ? 'text-amber-700' : failed ? 'text-red-500' : busy ? 'text-primary' : 'text-emerald-600'
+                      }`}
+                    >
+                      {deleting || deletingNow ? '删除中' : failed ? '入库失败' : busy ? `${d.stage ?? '处理中'} ${d.progress ?? 0}%` : '可用'}
+                    </span>
                     <button
                       type="button"
-                      title="删除文档（超级管理员）"
-                      onClick={async () => {
-                        await bankApi.removeDoc(bank.id, d.id)
-                        setDocs((prev) => prev.filter((x) => x.id !== d.id))
-                        onChanged()
+                      title="查看文档"
+                      aria-label={`查看文档 ${d.name}`}
+                      disabled={deleting || deletingNow}
+                      onClick={() => {
+                        const format = d.format.toUpperCase()
+                        if (format === 'PDF') {
+                          void openPdfDocument(bank.id, d.id).catch((err) => showToast(err instanceof Error ? err.message : '打开 PDF 失败', 'error'))
+                        } else if (['MD', 'MARKDOWN', 'TXT'].includes(format)) {
+                          setPreview(d)
+                        } else {
+                          showToast(`${format} 暂不支持内联预览，请使用下载按钮`, 'info')
+                        }
                       }}
-                      className="rounded p-1 text-ink-3 transition-colors hover:bg-red-50 hover:text-red-500"
+                      className="rounded p-1 text-ink-3 transition-colors hover:bg-primary-light hover:text-primary disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      <Eye size={14} />
+                    </button>
+                    <button
+                      type="button"
+                      title="下载文档"
+                      aria-label={`下载文档 ${d.name}`}
+                      disabled={deleting || deletingNow}
+                      onClick={() => void bankApi.downloadDoc(bank.id, d.id, d.name).catch((err) => showToast(err instanceof Error ? err.message : '下载失败', 'error'))}
+                      className="rounded p-1 text-ink-3 transition-colors hover:bg-primary-light hover:text-primary disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      <Download size={14} />
+                    </button>
+                  {bank.canDeleteDoc && (
+                    <button
+                      type="button"
+                      title={deleting ? '继续清理' : '删除文档'}
+                      aria-label={`${deleting ? '继续清理' : '删除文档'} ${d.name}`}
+                      disabled={deletingNow || !!busy}
+                      onClick={() => void removeDoc(d)}
+                      className="inline-flex items-center rounded p-1 text-ink-3 transition-colors hover:bg-red-50 hover:text-red-500 disabled:cursor-not-allowed disabled:opacity-40"
                     >
                       <Ban size={14} />
+                      {deleting && <span className="ml-1 text-xs">继续清理</span>}
                     </button>
                   )}
+                    </div>
+                    {!deleting && !deletingNow && ['DOCX', 'XLSX'].includes(d.format.toUpperCase()) && <p className="mt-1 text-xs text-ink-3">暂不支持内联预览，请使用下载按钮。</p>}
+                    <DocumentFailure doc={d} onRetry={bank.canUpload && !deletingNow ? async () => {
+                      try {
+                        await bankApi.reprocessDoc(bank.id, d.id)
+                        assertCurrentSession(session.current)
+                        onChanged()
+                        showToast(`「${d.name}」已重新排队解析`, 'success')
+                        const fresh = await bankApi.getBankDetail(bank.id)
+                        assertCurrentSession(session.current)
+                        setDocs(fresh.docs)
+                      } catch (err) {
+                        showToast(err instanceof Error ? err.message : '重新解析失败', 'error')
+                      }
+                    } : undefined} />
                 </li>
-              ))}
+                )
+              })}
             </ul>
 
-            {/* 上传区域：管理员可上传 */}
+            {/* 上传区域：可编辑成员可上传 */}
             {canUpload ? (
               <>
-                <div
-                  onDragOver={(e) => {
-                    e.preventDefault()
-                    setDragOver(true)
-                  }}
-                  onDragLeave={() => setDragOver(false)}
-                  onDrop={onDrop}
-                  onClick={() => fileInput.current?.click()}
-                  className={`flex cursor-pointer flex-col items-center justify-center gap-1.5 rounded-xl border-2 border-dashed px-4 py-4 text-center transition-colors ${
-                    dragOver ? 'border-primary bg-primary-light/40' : 'border-line hover:border-primary/50 hover:bg-page'
-                  }`}
-                >
-                  <FileUp size={18} className="text-primary" />
-                  <p className="text-sm text-ink-2">点击选择或拖拽文件到此处上传</p>
-                  <p className="text-xs text-ink-3">上传后自动向量化</p>
-                  <input
-                    ref={fileInput}
-                    type="file"
-                    className="hidden"
-                    onChange={(e) => {
-                      const f = e.target.files?.[0]
-                      if (f) start(f)
-                      e.target.value = ''
-                    }}
-                  />
-                </div>
-                {upload && (
-                  <div className="rounded-xl border border-primary/30 bg-primary-light/30 p-3">
-                    <div className="mb-1.5 flex items-center justify-between text-xs">
-                      <span className="truncate font-medium text-ink">{upload.name}</span>
-                      <span className={upload.phase === 'done' ? 'text-emerald-600' : 'text-primary'}>
-                        {upload.phase === 'upload' && `上传中 ${Math.floor(upload.pct)}%`}
-                        {upload.phase === 'vector' && `向量化中 ${Math.floor(upload.pct)}%`}
-                        {upload.phase === 'done' && '已完成'}
-                      </span>
-                    </div>
-                    <div className="h-2 overflow-hidden rounded-full bg-white">
-                      <div
-                        className={`h-full rounded-full transition-all duration-150 ${upload.phase === 'vector' ? 'bg-violet-500' : 'bg-primary'}`}
-                        style={{ width: `${upload.pct}%` }}
-                      />
-                    </div>
-                  </div>
-                )}
+                <DocumentDropZone busy={uploading} onFiles={(files) => { void start(files) }} />
               </>
             ) : (
               <div className="flex items-center gap-2.5 rounded-xl border border-dashed border-line bg-page px-4 py-3.5 text-ink-3">
                 <Lock size={15} className="shrink-0" />
-                <p className="text-xs leading-5">上传文档需要管理员权限，当前你在该题库为普通成员</p>
+                <p className="text-xs leading-5">当前权限为只读，只能查看、下载、检索和出题</p>
               </div>
             )}
           </section>
@@ -232,13 +254,24 @@ export default function BankViewModal({
         <div className="flex justify-end border-t border-line px-5 py-3.5">
           <button
             type="button"
-            onClick={onClose}
+            onClick={close}
+            disabled={uploading}
             className="rounded-lg border border-line px-4 py-2 text-sm text-ink-2 transition-colors hover:bg-page"
           >
             关闭
           </button>
         </div>
       </div>
+      {preview && (
+        <DocPreviewModal
+          key={preview.id}
+          bankId={bank.id}
+          docId={preview.id}
+          docName={preview.name}
+          docFormat={preview.format}
+          onClose={() => setPreview(null)}
+        />
+      )}
     </div>
   )
 }

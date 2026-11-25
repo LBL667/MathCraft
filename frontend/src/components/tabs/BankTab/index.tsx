@@ -8,9 +8,7 @@ import {
   FolderPlus,
   Loader2,
   Pencil,
-  Search,
   Trash2,
-  UserMinus,
   Users,
 } from 'lucide-react'
 import * as bankApi from '../../../api/banks'
@@ -69,47 +67,41 @@ function BankCode({ code }: { code: string }) {
 }
 
 export default function BankTab() {
-  const { showToast, refreshKbs } = useApp()
-  const [tab, setTab] = useState<SubTab>('owned')
+  const { role, showToast, refreshKbs, invalidateDocument } = useApp()
+  const canCreate = role === 'teacher'
+  const [tab, setTab] = useState<SubTab>(canCreate ? 'owned' : 'joined')
   const [owned, setOwned] = useState<ManagedBank[]>([])
   const [joined, setJoined] = useState<ManagedBank[]>([])
-  const [search, setSearch] = useState('')
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState('')
   const [editTarget, setEditTarget] = useState<ManagedBank | null>(null)
   const [viewTarget, setViewTarget] = useState<ManagedBank | null>(null)
   const [createOpen, setCreateOpen] = useState(false)
   const [deleteTarget, setDeleteTarget] = useState<ManagedBank | null>(null)
   const [quitTarget, setQuitTarget] = useState<ManagedBank | null>(null)
-  const [joining, setJoining] = useState(false)
 
   const refresh = useCallback(async () => {
     const [o, j] = await Promise.all([bankApi.listOwned(), bankApi.listJoined()])
     setOwned(o)
     setJoined(j)
+    setLoadError('')
     // 同步刷新智能出题侧边栏的「选择题库文档」选项
-    void refreshKbs()
+    await refreshKbs()
   }, [refreshKbs])
 
   useEffect(() => {
-    void refresh().finally(() => setLoading(false))
+    void refresh().catch((err) => {
+      setLoadError(err instanceof Error ? err.message : '刷新题库失败')
+    }).finally(() => setLoading(false))
   }, [refresh])
 
-  const join = async () => {
-    const code = search.trim()
-    if (!code) {
-      showToast('请输入要加入的题库编号')
-      return
-    }
-    setJoining(true)
+  const refreshAfterChange = async (message = '刷新题库失败') => {
     try {
-      const bank = await bankApi.joinByCode(code)
-      showToast(`已加入题库「${bank.name}」`)
-      setSearch('')
       await refresh()
     } catch (err) {
-      showToast(err instanceof Error ? err.message : '加入失败')
-    } finally {
-      setJoining(false)
+      const detail = `${message}：${err instanceof Error ? err.message : '请稍后重试'}`
+      setLoadError(detail)
+      showToast(detail)
     }
   }
 
@@ -119,6 +111,10 @@ export default function BankTab() {
 
   return (
     <div className="flex-1 overflow-y-auto p-5">
+      {loadError && <div role="alert" className="mb-3 flex items-center justify-between gap-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+        <span>{loadError}</span>
+        <button type="button" onClick={() => void refreshAfterChange()} className="shrink-0 rounded px-2 py-1 underline">重新读取</button>
+      </div>}
       {/* 子标签页 */}
       <div className="flex items-center gap-7 border-b border-line px-1">
         {(
@@ -147,13 +143,13 @@ export default function BankTab() {
         <div className="mt-4 rounded-xl border border-line/70 bg-white shadow-[0_4px_16px_rgba(30,90,180,0.05)]">
           <div className="flex items-center justify-between gap-4 px-5 pt-4 pb-3">
             <h3 className="text-sm font-bold text-ink">题库管理</h3>
-            <button
+            {canCreate && <button
               type="button"
               onClick={() => setCreateOpen(true)}
               className="inline-flex items-center gap-1 rounded-lg bg-primary px-3.5 py-2 text-sm font-semibold text-white shadow-[0_4px_14px_rgba(30,111,255,0.35)] transition-colors hover:bg-[#1a5fe6]"
             >
               <FolderPlus size={15} /> 新建题库
-            </button>
+            </button>}
           </div>
 
           <table className="w-full">
@@ -186,7 +182,14 @@ export default function BankTab() {
                   <td className="px-5 py-3.5">
                     <div className="flex items-center gap-3">
                       <FolderIcon />
-                      <span className="text-sm font-medium text-ink">{b.name}</span>
+                      <div className="min-w-0">
+                        <span className="text-sm font-medium text-ink">{b.name}</span>
+                        {b.status === 'deleting' && <>
+                          <span className="ml-2 rounded bg-amber-50 px-1.5 py-0.5 text-xs text-amber-700">删除中</span>
+                          <p className="mt-1 text-xs text-ink-3">{b.stage || '清理尚未完成，请继续清理'}</p>
+                          {b.errorMessage && <p className="mt-1 break-words text-xs text-red-700">{b.errorMessage}</p>}
+                        </>}
+                      </div>
                     </div>
                   </td>
                   <td className="px-3 py-3.5">
@@ -197,11 +200,17 @@ export default function BankTab() {
                   </td>
                   <td className="px-5 py-3.5">
                     <div className="flex items-center justify-end gap-2">
-                      <button type="button" onClick={() => setEditTarget(b)} className={editBtn}>
+                      <button type="button" disabled={!b.canEdit || b.status === 'deleting'} onClick={async () => {
+                        try {
+                          setEditTarget(await bankApi.getBankDetail(b.id))
+                        } catch (err) {
+                          showToast(err instanceof Error ? err.message : '读取题库最新信息失败')
+                        }
+                      }} className={`${editBtn} disabled:cursor-not-allowed disabled:opacity-40`}>
                         <Pencil size={12} /> 编辑
                       </button>
-                      <button type="button" onClick={() => setDeleteTarget(b)} className={dangerBtn}>
-                        <Trash2 size={12} /> 删除
+                      <button type="button" disabled={!b.canDelete} onClick={() => setDeleteTarget(b)} className={`${dangerBtn} disabled:cursor-not-allowed disabled:opacity-40`}>
+                        <Trash2 size={12} /> {b.status === 'deleting' ? '继续清理' : '删除'}
                       </button>
                     </div>
                   </td>
@@ -212,97 +221,16 @@ export default function BankTab() {
         </div>
       )}
 
-      {/* 我加入的题库 */}
+            {/* 我加入的题库 */}
       {tab === 'joined' && (
         <div className="mt-4 rounded-xl border border-line/70 bg-white shadow-[0_4px_16px_rgba(30,90,180,0.05)]">
-          <div className="flex items-center justify-end gap-2.5 px-5 pt-4 pb-3">
-            <div className="relative">
-              <Search size={14} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-ink-3" />
-              <input
-                type="text"
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') void join()
-                }}
-                placeholder="请输入题库编号进行搜索并加入"
-                className="w-64 rounded-lg border border-line py-2 pl-8 pr-3 text-sm text-ink outline-none transition-colors placeholder:text-ink-3 focus:border-primary"
-              />
-            </div>
-            <button
-              type="button"
-              onClick={() => void join()}
-              disabled={joining}
-              className="rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-white shadow-[0_4px_14px_rgba(30,111,255,0.35)] transition-colors hover:bg-[#1a5fe6] disabled:opacity-60"
-            >
-              {joining ? <Loader2 size={14} className="animate-spin" /> : '加入'}
-            </button>
-          </div>
-
+          <div className="px-5 pt-4 pb-3 text-sm text-ink-3">题库成员由创建者在成员设置中添加，请联系创建者授权。</div>
           <table className="w-full">
-            <thead>
-              <tr className="border-y border-line/70 bg-page/60 text-left text-xs text-ink-3">
-                <th className="px-5 py-2.5 font-normal">题库名称</th>
-                <th className="px-3 py-2.5 font-normal">题库编号</th>
-                <th className="px-3 py-2.5 font-normal">人数</th>
-                <th className="px-3 py-2.5 font-normal">创建者</th>
-                <th className="px-5 py-2.5 text-right font-normal">操作</th>
-              </tr>
-            </thead>
+            <thead><tr className="border-y border-line/70 bg-page/60 text-left text-xs text-ink-3"><th className="px-5 py-2.5 font-normal">题库名称</th><th className="px-3 py-2.5 font-normal">题库编号</th><th className="px-3 py-2.5 font-normal">人数</th><th className="px-3 py-2.5 font-normal">创建者</th><th className="px-5 py-2.5 text-right font-normal">操作</th></tr></thead>
             <tbody>
-              {loading && (
-                <tr>
-                  <td colSpan={5} className="py-10 text-center text-sm text-ink-3">
-                    <Loader2 size={16} className="mr-2 inline animate-spin" />
-                    正在加载题库…
-                  </td>
-                </tr>
-              )}
-              {!loading && joined.length === 0 && (
-                <tr>
-                  <td colSpan={5} className="py-10 text-center text-sm text-ink-3">
-                    还没有加入任何题库，输入编号即可加入
-                  </td>
-                </tr>
-              )}
-              {joined.map((b) => (
-                <tr key={b.id} className="border-b border-line/50 transition-colors last:border-0 hover:bg-page/50">
-                  <td className="px-5 py-3.5">
-                    <div className="flex items-center gap-3">
-                      <FolderIcon />
-                      <span className={`text-sm font-medium ${b.quitted ? 'text-ink-3' : 'text-ink'}`}>{b.name}</span>
-                    </div>
-                  </td>
-                  <td className="px-3 py-3.5">
-                    <BankCode code={b.code} />
-                  </td>
-                  <td className="px-3 py-3.5">
-                    <MemberCount count={b.memberCount} capacity={b.capacity} />
-                  </td>
-                  <td className="px-3 py-3.5">
-                    <div className="flex items-center gap-2">
-                      <Avatar name={b.creator} size="sm" />
-                      <span className="text-sm text-ink-2">{b.creator}</span>
-                    </div>
-                  </td>
-                  <td className="px-5 py-3.5">
-                    <div className="flex items-center justify-end gap-2">
-                      <button type="button" onClick={() => setViewTarget(b)} className={editBtn}>
-                        <Pencil size={12} /> 查看
-                      </button>
-                      {b.quitted ? (
-                        <button type="button" disabled className={`${dangerBtn} cursor-not-allowed opacity-60`}>
-                          已退出
-                        </button>
-                      ) : (
-                        <button type="button" onClick={() => setQuitTarget(b)} className={dangerBtn}>
-                          <UserMinus size={12} /> 退出
-                        </button>
-                      )}
-                    </div>
-                  </td>
-                </tr>
-              ))}
+              {loading && <tr><td colSpan={5} className="py-10 text-center text-sm text-ink-3"><Loader2 size={16} className="mr-2 inline animate-spin" />正在加载题库…</td></tr>}
+              {!loading && joined.length === 0 && <tr><td colSpan={5} className="py-10 text-center text-sm text-ink-3">还没有加入任何题库，请联系题库创建者添加</td></tr>}
+              {joined.map((b) => <tr key={b.id} className="border-b border-line/50 last:border-0 hover:bg-page/50"><td className="px-5 py-3.5"><div className="flex items-center gap-3"><FolderIcon /><span className="text-sm font-medium text-ink">{b.name}</span></div></td><td className="px-3 py-3.5"><BankCode code={b.code} /></td><td className="px-3 py-3.5"><MemberCount count={b.memberCount} capacity={b.capacity} /></td><td className="px-3 py-3.5"><div className="flex items-center gap-2"><Avatar name={b.creator} size="sm" /><span className="text-sm text-ink-2">{b.creator}</span></div></td><td className="px-5 py-3.5 text-right"><button type="button" onClick={() => setViewTarget(b)} className={editBtn}><Pencil size={12} /> 查看</button></td></tr>)}
             </tbody>
           </table>
         </div>
@@ -313,20 +241,32 @@ export default function BankTab() {
         <BankEditModal
           bank={editTarget}
           onClose={() => setEditTarget(null)}
-          onChanged={() => void refresh()}
+          onChanged={(deletedDocumentId) => {
+            if (deletedDocumentId) invalidateDocument(editTarget.id, deletedDocumentId)
+            void refreshAfterChange()
+          }}
         />
       )}
-      {viewTarget && <BankViewModal bank={viewTarget} onClose={() => setViewTarget(null)} onChanged={() => void refresh()} />}
-      {createOpen && <BankCreateModal onClose={() => setCreateOpen(false)} onChanged={() => void refresh()} />}
+      {viewTarget && <BankViewModal bank={viewTarget} onClose={() => setViewTarget(null)} onChanged={(deletedDocumentId) => {
+        if (deletedDocumentId) invalidateDocument(viewTarget.id, deletedDocumentId)
+        void refreshAfterChange()
+      }} />}
+      {canCreate && createOpen && <BankCreateModal onClose={() => setCreateOpen(false)} onChanged={() => void refreshAfterChange()} />}
       {deleteTarget && (
         <ConfirmDialog
-          title="删除题库"
+          title={deleteTarget.status === 'deleting' ? '继续清理题库' : '删除题库'}
           message={`确定删除题库「${deleteTarget.name}」吗？题库内的文档与索引将一并移除，操作不可恢复。`}
-          confirmText="确认删除"
+          confirmText={deleteTarget.status === 'deleting' ? '继续清理' : '确认删除'}
           onConfirm={async () => {
-            await bankApi.deleteBank(deleteTarget.id)
+            try {
+              await bankApi.deleteBank(deleteTarget.id)
+            } catch (err) {
+              await refreshAfterChange('删除未完成，刷新题库失败')
+              throw err
+            }
+            setOwned((prev) => prev.filter((bank) => bank.id !== deleteTarget.id))
             showToast(`题库「${deleteTarget.name}」已删除`)
-            await refresh()
+            await refreshAfterChange('题库已删除，但刷新列表失败')
           }}
           onClose={() => setDeleteTarget(null)}
         />
@@ -338,8 +278,9 @@ export default function BankTab() {
           confirmText="确认退出"
           onConfirm={async () => {
             await bankApi.quitBankById(quitTarget.id)
+            setJoined((prev) => prev.filter((bank) => bank.id !== quitTarget.id))
             showToast(`已退出题库「${quitTarget.name}」`)
-            await refresh()
+            await refreshAfterChange('已退出题库，但刷新列表失败')
           }}
           onClose={() => setQuitTarget(null)}
         />

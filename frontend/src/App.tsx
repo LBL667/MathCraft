@@ -1,8 +1,9 @@
 import { AppProvider, useApp } from './store/AppContext'
 import { AuthProvider, useAuth } from './store/AuthContext'
+import { ToastProvider } from './store/ToastContext'
 import TopBar from './components/layout/TopBar'
 import SideNav from './components/layout/SideNav'
-import ParamsSidebar from './components/layout/ParamsSidebar'
+import HistorySidebar from './components/layout/HistorySidebar'
 import TabBar from './components/layout/TabBar'
 import GenerateTab from './components/tabs/GenerateTab'
 import PreviewTab from './components/tabs/PreviewTab'
@@ -11,15 +12,17 @@ import RecordsTab from './components/tabs/RecordsTab'
 import FavoritesTab from './components/tabs/FavoritesTab'
 import SpaceTab from './components/tabs/SpaceTab'
 import ProfileTab from './components/tabs/ProfileTab'
+import ApiConfigModal from './components/tabs/ProfileTab/ApiConfigModal'
 import Toast from './components/ui/Toast'
 import LoginPage from './components/auth/LoginPage'
+import AdminPanel from './components/admin/AdminPanel'
 
 function Shell() {
   const { activeTab } = useApp()
   return (
-    <div className="flex h-screen animate-fade-in flex-col bg-page text-ink">
+    <div className="workspace-shell flex h-screen animate-fade-in flex-col bg-page text-ink">
       <TopBar />
-      <div className="relative flex min-h-0 flex-1">
+      <div className="workspace-body relative flex min-h-0 flex-1">
         <SideNav />
         <main className="z-10 mx-4 my-4 flex min-w-0 flex-1 flex-col overflow-hidden rounded-2xl border border-line/70 bg-white shadow-[0_6px_24px_rgba(30,90,180,0.06)]">
           {activeTab === 'bank' ? (
@@ -49,19 +52,21 @@ function Shell() {
             </>
           )}
         </main>
-        {activeTab === 'generate' && <ParamsSidebar />}
+        {activeTab === 'generate' && <HistorySidebar />}
       </div>
-      <Toast />
+      <ApiConfigModal />
     </div>
   )
 }
 
 /** 登录门禁：未登录渲染登录页（登录成功整页淡出），已登录挂载主应用并淡入 */
 function AuthGate() {
-  const { user } = useAuth()
+  const { user, restoring } = useAuth()
+  if (restoring) return <div className="flex min-h-screen items-center justify-center bg-page text-ink" role="status">正在恢复安全会话…</div>
   if (!user) return <LoginPage />
+  if (user.role === 'admin') return <AdminPanel />
   return (
-    <AppProvider>
+    <AppProvider key={`${user.userId}:${user.role}`}>
       <Shell />
     </AppProvider>
   )
@@ -70,7 +75,10 @@ function AuthGate() {
 export default function App() {
   return (
     <AuthProvider>
-      <AuthGate />
+      <ToastProvider>
+        <AuthGate />
+        <Toast />
+      </ToastProvider>
     </AuthProvider>
   )
 }
