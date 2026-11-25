@@ -1,23 +1,71 @@
-"""pytest 公共夹具：临时 SQLite + Redis 15 号库，外部模型全部打桩。"""
+"""pytest 公共夹具：临时 SQLite + 进程内隔离 Redis，外部模型全部打桩。"""
+# ruff: noqa: E402 -- 必须先设置隔离环境与假凭据，再导入应用。
+import itertools
+import json
 import os
 import re
 import sys
+import socket
 import tempfile
+import threading
+from datetime import datetime, timezone
 from pathlib import Path
+from types import ModuleType
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # 必须在导入 app 之前设置环境变量（settings 在模块导入时实例化）
 TEST_ROOT = Path(tempfile.mkdtemp(prefix="mathcraft_test_"))
 os.environ["DATABASE_URL"] = f"sqlite:///{(TEST_ROOT / 'test.db').as_posix()}?check_same_thread=false"
-os.environ["REDIS_URL"] = "redis://127.0.0.1:6379/15"
+os.environ["REDIS_URL"] = "redis://127.0.0.1:1/15"
+os.environ["APP_ENV"] = "test"
+os.environ["AUTH_JWT_SECRET"] = "test-only-jwt-secret-not-for-production-0123456789"
+os.environ["AUTH_CODE_SECRET"] = "test-only-code-secret-not-for-production-0123456789"
 os.environ["CHROMA_DIR"] = str(TEST_ROOT / "chroma")
 os.environ["UPLOAD_DIR"] = str(TEST_ROOT / "uploads")
 os.environ["OCR_DIR"] = str(TEST_ROOT / "ocr")
 os.environ["AVATAR_DIR"] = str(TEST_ROOT / "avatars")
 os.environ["DEEPSEEK_API_KEY"] = ""
+# 用例固定回 DeepSeek 官方默认模型与地址，不受部署环境变量影响
+os.environ["DEEPSEEK_MODEL"] = "deepseek-flash"
+os.environ["DEEPSEEK_BASE_URL"] = "https://api.deepseek.com"
 os.environ["CORS_ORIGINS"] = "http://127.0.0.1:5173"
 
+# 测试从不读取个人 local_secrets.py；外部凭据固定为空。
+_test_secrets = ModuleType("app.local_secrets")
+_test_secrets.SILICONFLOW_API_KEY = ""
+_test_secrets.MINERU_DEFAULT_TOKEN = "fake-mineru-token-for-isolated-tests-only"
+sys.modules["app.local_secrets"] = _test_secrets
+
+# 在 Settings 类首次实例化前排除 dotenv/file-secret 来源及继承的个人环境值。
+# 只接收上方显式设置的测试变量；构造参数仍可供配置单元测试使用。
+from pydantic_settings import BaseSettings
+
+_TEST_ENV_KEYS = {
+    "database_url", "redis_url", "app_env", "auth_jwt_secret", "auth_code_secret",
+    "chroma_dir", "upload_dir", "ocr_dir", "avatar_dir", "deepseek_api_key", "cors_origins",
+}
+_original_sources = BaseSettings.settings_customise_sources.__func__
+
+
+def _test_settings_sources(cls, settings_cls, init_settings, env_settings,
+                           dotenv_settings, file_secret_settings):
+    if settings_cls.__module__ == "app.config":
+        env_settings.env_vars = {
+            key: value for key, value in env_settings.env_vars.items() if key in _TEST_ENV_KEYS
+        }
+        return init_settings, env_settings
+    return _original_sources(cls, settings_cls, init_settings, env_settings,
+                             dotenv_settings, file_secret_settings)
+
+
+# DotEnvSettingsSource 会在 sources 选择前读取文件，因此同时禁止其读取入口。
+from pydantic_settings.sources import DotEnvSettingsSource
+
+DotEnvSettingsSource._read_env_files = lambda self: {}
+BaseSettings.settings_customise_sources = classmethod(_test_settings_sources)
+
+import fakeredis
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import text
@@ -29,6 +77,7 @@ from app.models import User, UserModelSetting
 from app.models.base import new_id
 from app.services.auth import hash_password
 from app.services import cache
+from app.services import question_review
 from app.services.rag import embeddings, llm, question_gen, rerank, slots
 
 
@@ -37,10 +86,10 @@ from app.services.rag import embeddings, llm, question_gen, rerank, slots
 def fake_embed_texts(texts: list[str]) -> list[list[float]]:
     """确定性 1024 维向量，保证 Chroma 可正常检索且不访问网络。"""
     out = []
-    for text in texts:
+    for content in texts:
         vec = [0.0] * 1024
         vec[0] = 0.5
-        for i, ch in enumerate(text[:128]):
+        for i, ch in enumerate(content[:128]):
             vec[(ord(ch) + i * 17) % 1024] += 1.0
         out.append(vec)
     return out
@@ -56,7 +105,10 @@ def fake_rerank(query: str, documents: list[str], top_n: int | None = None) -> l
     return [{"index": i, "score": s} for i, s in scored[: (top_n or len(documents))]]
 
 
-def fake_question_chat_json(messages, api_key=None, retries=1) -> dict:
+_stem_seq = itertools.count(1)
+
+
+def fake_question_chat_json(messages, api_key=None, retries=1, **kwargs) -> dict:
     prompt = messages[-1]["content"]
     m = re.search(r"必须严格为 ([a-z]+)", prompt)
     qtype = m.group(1) if m else "single"
@@ -64,12 +116,14 @@ def fake_question_chat_json(messages, api_key=None, retries=1) -> dict:
     count = int(m2.group(1)) if m2 else 1
 
     questions = []
-    for i in range(count):
+    for _ in range(count):
+        # 每次调用都换一个题干，单题拆批后多批并发才不会互相判重
+        i = next(_stem_seq)
         base = {
             "type": qtype,
             "score": 5,
             "difficulty": "中",
-            "stem": f"第{i + 1}题：函数 $f(x)=x^{i + 2}$ 的导数是什么？",
+            "stem": f"第{i}题：函数 $f(x)=x^{i + 2}$ 的导数是什么？",
             "options": [],
             "answer": f"${i + 2}x^{i + 1}$",
             "analysis": "由幂函数求导法则可得。",
@@ -90,7 +144,16 @@ def fake_question_chat_json(messages, api_key=None, retries=1) -> dict:
     return {"questions": questions}
 
 
-def fake_slot_chat_json(messages, api_key=None, retries=1) -> dict:
+def fake_question_chat_stream(messages, api_key=None, max_tokens=None,
+                              thinking_off=False, temperature=0.7, **kwargs):
+    """出题走流式滚动解析；假服务按 24 字符分片输出同款 JSON。"""
+    payload = fake_question_chat_json(messages)
+    text = json.dumps(payload, ensure_ascii=False)
+    for i in range(0, len(text), 24):
+        yield text[i:i + 24]
+
+
+def fake_slot_chat_json(messages, api_key=None, retries=1, **kwargs) -> dict:
     return {
         "types": [{"type": "single", "count": 2}],
         "scope": "导数",
@@ -101,14 +164,81 @@ def fake_slot_chat_json(messages, api_key=None, retries=1) -> dict:
 
 
 @pytest.fixture(autouse=True)
+def prohibit_network(monkeypatch):
+    """拒绝服务网络；仅允许 Windows asyncio 自身 socketpair 的本地管道。"""
+    pair_context = threading.local()
+    original_connect = socket.socket.connect
+    original_pair = socket.socketpair
+
+    def denied(*args, **kwargs):
+        raise AssertionError("测试禁止真实网络连接；请注入假服务")
+
+    def connect(instance, address):
+        if getattr(pair_context, "active", False):
+            return original_connect(instance, address)
+        return denied()
+
+    def socketpair(*args, **kwargs):
+        pair_context.active = True
+        try:
+            return original_pair(*args, **kwargs)
+        finally:
+            pair_context.active = False
+
+    monkeypatch.setattr(socket.socket, "connect", connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", denied)
+    monkeypatch.setattr(socket, "create_connection", denied)
+    monkeypatch.setattr(socket, "socketpair", socketpair)
+
+
+def fake_llm_chat_json(messages, api_key=None, retries=1, max_tokens=None,
+                       thinking_off=False, thinking=None, **kwargs) -> dict:
+    """JSON 调用桩：解题分两步，求解只给答案，讲解给解析与干扰项。"""
+    system = (messages or [{}])[0].get("content", "") if messages else ""
+    user = messages[-1].get("content", "") if messages else ""
+    m = re.search(r"【题型】(\S+?题)", user)
+    qtype_cn = m.group(1) if m else "单选题"
+    if "数学解题专家" in system:
+        if qtype_cn == "多选题":
+            return {"answer": ["$18$", "$-18$"], "confidence": "high"}
+        if qtype_cn == "判断题":
+            return {"answer": "正确", "confidence": "high"}
+        return {"answer": "$18$", "confidence": "high"}
+    if "数学阅卷讲评老师" in system:
+        if qtype_cn == "单选题":
+            return {"analysis": "关键步骤：列式求解得 $18$。",
+                    "distractors": ["$-18$", "$81$", "$8.1$"], "confidence": "high"}
+        if qtype_cn == "多选题":
+            return {"analysis": "关键步骤：逐项判断。",
+                    "distractors": ["$81$", "$8.1$"], "confidence": "high"}
+        return {"analysis": "关键步骤：按定义判断成立。", "confidence": "high"}
+    return {}
+
+
+@pytest.fixture(autouse=True)
 def fake_models(monkeypatch):
+    monkeypatch.setattr(llm, "_platform_cache", None)
+    monkeypatch.setattr(llm, "_platform_cached_at", 0.0)
     monkeypatch.setattr(embeddings, "embed_texts", fake_embed_texts)
     monkeypatch.setattr(embeddings, "embed_one", lambda t: fake_embed_texts([t])[0])
     monkeypatch.setattr(rerank, "rerank", fake_rerank)
     monkeypatch.setattr(llm, "chat_text", lambda *a, **k: "假设段落：导数的定义与求导法则。")
-    monkeypatch.setattr(llm, "chat_json", lambda *a, **k: {})
-    monkeypatch.setattr(question_gen, "chat_json", fake_question_chat_json)
+    monkeypatch.setattr(llm, "chat_json", fake_llm_chat_json)
+    monkeypatch.setattr(llm, "chat_stream", fake_question_chat_stream)
     monkeypatch.setattr(slots, "chat_json", fake_slot_chat_json)
+    def review_with_fake_solver(
+        db, user_id, questions, params, doc_name, api_key=None,
+        hyde_text=None, progress=None, cancel_check=None,
+    ):
+        """接口用例跳过质量评审，新命题仍由既有假 solver 补齐答案。"""
+        stats = question_review.ReviewStats()
+        question_review._solve_all(
+            [question for question in questions if not question.answer],
+            api_key, stats, cancel_check=cancel_check,
+        )
+        return questions, stats
+
+    monkeypatch.setattr(question_review, "review_questions", review_with_fake_solver)
     yield
 
 
@@ -138,6 +268,10 @@ def _seed_users() -> None:
                 identity="教师" if role == "teacher" else "学生",
                 display_name=name,
                 user_no=user_no,
+                email=f"{account}@example.test",
+                email_normalized=f"{account}@example.test",
+                email_verified=True,
+                email_verified_at=datetime.now(timezone.utc),
                 school="广东金融学院",
                 status="active",
             )
@@ -149,10 +283,34 @@ def _seed_users() -> None:
         db.close()
 
 
+@pytest.fixture(autouse=True)
+def fake_auth_verification():
+    """在 HTTP 依赖边界替换 Turnstile，测试不访问外部验证服务。"""
+    from app.services.auth_delivery import get_turnstile_verifier
+
+    class Verifier:
+        def verify(self, token: str, action: str, remote_ip: str) -> None:
+            if token != "test-turnstile-token":
+                from app.errors import AppError
+                raise AppError("TURNSTILE_FAILED", "测试人机验证失败", 403)
+
+    fastapi_app.dependency_overrides[get_turnstile_verifier] = lambda: Verifier()
+    yield
+    fastapi_app.dependency_overrides.pop(get_turnstile_verifier, None)
+
+
+@pytest.fixture(autouse=True)
+def isolated_redis(monkeypatch):
+    """每个测试使用独立内存 Redis，绝不连接或清空本机实例。"""
+    instance = fakeredis.FakeRedis(decode_responses=True)
+    monkeypatch.setattr(cache, "get_redis", lambda: instance)
+    yield instance
+    instance.close()
+
+
 @pytest.fixture()
 def client():
     _reset_database()
-    cache.get_redis().flushdb()
     _seed_users()
     with TestClient(fastapi_app) as c:
         yield c
@@ -170,9 +328,12 @@ def db():
 @pytest.fixture()
 def auth(client):
     def _login(account: str, role: str, password: str = "123123") -> dict:
-        resp = client.post("/api/auth/login", json={"account": account, "password": password, "role": role})
+        resp = client.post("/api/auth/login/account", json={
+            "account": account, "password": password,
+            "turnstile_token": "test-turnstile-token",
+        })
         assert resp.status_code == 200, resp.text
-        return {"Authorization": f"Bearer {resp.json()['token']}"}
+        return {"Authorization": f"Bearer {resp.json()['access_token']}"}
 
     return _login
 
