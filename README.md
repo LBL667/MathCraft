@@ -1,83 +1,244 @@
-# RiddleMe 出题智能体前端
+# MathCraft — 数学智能教学平台
 
-基于设计稿实现的前端演示项目。当前未接入后端，所有数据访问收敛到 mock 层，接口已按 REST 风格预留，可平滑切换真实后端。纯前端构建产物可直接部署到 GitHub Pages。
+MathCraft 面向教师与学生，提供题库协作、文档解析与检索、智能出题、组卷发布、学生作答和 AI 批卷。后端使用 FastAPI，前端使用 React 19 + TypeScript + Vite，数据存储采用 SQLite、Redis 与 Chroma。
 
-## 功能
+- 教师：管理题库与学习空间，上传教学资料，出题、组卷、发布试卷和催交。
+- 学生：加入学习空间，作答、查看获准公开的解析，收藏题目。
+- 管理员：开通与管理账号，维护平台模型、检索配置和索引重建。
 
-- 智能生成标签页：动态机器人形象、快捷提问、对话式出题入口
-- 右侧题目参数面板：选择知识库 → 文档、勾选题型并设置题数、选择难度，支持向右折叠；左侧导航支持向左折叠
-- 题目预览标签页：题型胶囊筛选、题目难度筛选、滚轮滚动列表
-- 题目卡片：LaTeX 公式渲染（含矩阵等高等数学公式）、分值右侧行内编辑、答案与解析默认折叠可展开
-- 编辑模式：题干、选项、答案、解析均可修改，LaTeX 以源码形式编辑，编辑时自动展开答案与解析
-- 删除、收藏、全选
-- 组卷弹窗：按题型模块排序（上移/下移）、多选发布学习空间、保存到组卷记录（默认勾选）、发布/取消
+文档支持 PDF、DOCX、XLSX、Markdown 和 TXT；扫描件通过 MinerU OCR 解析，检索采用向量与全文混合召回、重排，出题与批卷使用 DeepSeek。
 
-## 快速开始
+对话提供快速出题、创新命题、知识答疑和数据管理四模式，右侧历史会话支持继续已有对话。出题先命制题干，再独立解题生成答案、选项和解析，审核后按题型缺口尝试补齐；界面通过进度轮询等待结果。题目预览中勾选题目后可导出 Word，设置题型顺序、答案和解析的位置。
 
-```bash
-cd frontend
-npm install
-npm run dev        # 本地开发，默认 http://localhost:5173
-npm run build      # 类型检查 + 产出 dist/
-npm run preview    # 本地预览构建产物
-```
+试卷支持关闭和恢复作答，删除保留已有作答及成绩；出题任务状态存入 SQL，服务重启后未完成的任务标为中断，用户可重新发起。一键清空删除当前预览的题目并保留对话。生成期间和暂停待确认期间，清空按钮禁用。若暂停前本轮已保存，先恢复结果供用户查看和清空。
+
+学习空间可在停止作答后移除尚无作答记录的发布；已有作答保留历史入口。删除未完成的题库与资料在管理页提供继续清理入口。
+
+两类出题入口已接入正式运行台账，运维 V2 提供管理员概览、运行列表和详情查询；前端已对接 V2 概览、运行列表与基本详情。台账不可用时查询返回 503，不回退演示数据。范围、字段和交接见[运维查询 V2](docs/design/运维查询V2接口与查询设计.md)。
 
 ## 目录结构
 
+以下列出主要源码、配置与文档入口：
+
+```text
+MathCraft/
+├── .github/                  # CI、发布工作流及发布门禁脚本
+├── backend/                  # FastAPI 后端
+│   ├── app/                  # 接口、数据模型与业务服务
+│   ├── alembic/              # 数据库迁移
+│   ├── scripts/              # 配置初始化与账号管理
+│   ├── tests/                # 后端测试与隔离页面联调辅助
+│   └── README.md             # 后端配置、迁移与排错
+├── frontend/                 # React + TypeScript 前端
+│   ├── src/                  # 页面、组件、API 与状态管理
+│   └── README.md             # 前端开发说明
+├── docs/                     # API、设计与维护文档
+│   ├── api.md                # API 索引
+│   ├── 测试与持续集成.md     # 测试范围与 CI 维护说明
+│   ├── design/               # 功能与架构设计
+│   ├── requirements/         # 产品需求与待定讨论
+│   ├── implementation/       # 实施、交接与历史验收
+│   ├── research/             # 调查与评估
+│   ├── reference/            # 参考清单
+│   ├── operations/           # 运维手册
+│   └── archive/              # 已失效方案归档
+├── tools/                    # 文档生成与维护工具
+│   ├── archive/              # 失效脚本历史归档，不用于当前验收
+│   └── ops_g0/               # 历史工具及独立测试
+├── apps/desktop/             # 桌面客户端预留目录
+├── packages/contracts/       # 共享契约预留目录
+├── compose.yaml              # 本地 Redis 容器
+├── compose.phoenix.yaml      # 可选 Phoenix 追踪服务
+├── pyproject.toml            # 仓库级依赖与检查配置
+├── openapi.json              # 接口契约
+├── AGENTS.md                 # 协作约定
+└── STUBS.md                  # 开发演示与历史替身说明
 ```
-frontend/src/
-├── api/
-│   ├── client.ts          # API 端点常量 + ApiClient 接口 + 适配器选择
-│   └── mock/
-│       ├── mockData.ts    # 知识库、文档、学习空间、题目模板库
-│       └── mockAdapter.ts # Mock 适配器（模拟网络延迟）
-├── components/
-│   ├── layout/            # 顶栏、左侧导航、参数面板、标签栏、装饰
-│   ├── tabs/GenerateTab/  # 智能生成（机器人、快捷提问、输入框）
-│   ├── tabs/PreviewTab/   # 题目预览（卡片、答案面板、组卷弹窗）
-│   └── ui/                # Toast、下拉选择
-├── lib/latex.tsx          # KaTeX 渲染组件（$...$ / $$...$$）
-├── store/AppContext.tsx   # 全局状态
-└── types/index.ts         # 领域类型
+
+## 启动方法
+
+以下命令以 PowerShell 为例。先在终端进入仓库根目录，即包含 `compose.yaml`、`backend/` 和 `frontend/` 的目录；Redis、后端、前端按顺序启动。
+
+### 1. 准备环境
+
+安装 Python 3.11 及以上、uv、Node.js 22.13 及以上的 22.x 版本或 Node.js 24 及以上（含 npm），以及 Docker 与 Compose v2。Windows 使用 Docker Desktop 的 Linux 容器引擎，并先启动 Docker Desktop；已有 Redis 7 及以上服务时可直接使用。
+
+```powershell
+python --version
+uv --version
+node --version
+npm --version
+docker compose version
 ```
 
-## 接入真实后端
+模型出题、向量检索与 OCR 需要访问相应外部服务，并配置凭据。
 
-`src/api/client.ts` 中已列出全部预留端点：
+### 2. 启动 Redis
 
-```
-GET  /api/knowledge-bases
-GET  /api/knowledge-bases/:kbId/documents
-GET  /api/study-spaces
-POST /api/questions/generate
-PUT  /api/questions/:id
-DELETE /api/questions/:id
-POST /api/papers/publish
-GET  /api/assemble-records
+在仓库根目录执行：
+
+```powershell
+docker compose config --quiet
+docker compose up -d --wait redis
+docker compose exec redis redis-cli ping
 ```
 
-实现一个 `httpAdapter` 满足 `ApiClient` 接口（用 fetch 或 axios 调上述端点），然后把 `client.ts` 末尾的
+最后一条命令应返回 `PONG`。默认监听 `127.0.0.1:6379`，数据保存到 Docker 命名卷。若端口已被现有 Redis 占用，直接使用该服务，并在下一步配置对应的 `REDIS_URL`。
 
-```ts
-export const api: ApiClient = mockAdapter
+### 3. 安装后端依赖并初始化配置
+
+在同一终端进入 `backend/`：
+
+```powershell
+cd backend
+uv sync
+uv run python scripts/init_auth_secrets.py
+if (-not (Test-Path app/local_secrets.py)) {
+    Copy-Item app/local_secrets.example.py app/local_secrets.py
+}
 ```
 
-替换为 `httpAdapter` 即可，页面组件零改动。
+出题 JSON 修复依赖 `json-repair`，Word 导出依赖 `python-docx`、`latex2mathml` 和 `mathml2omml`，由上述 `uv sync` 安装。升级时需重新同步依赖；仓库根环境与后端独立环境分别由各自的 `pyproject.toml`、`uv.lock` 管理，使用哪个环境就同步哪个环境。导出在本地生成文档，无需模型调用或安装 Microsoft Word。
 
-## 部署到 GitHub Pages
+OpenAI 兼容客户端使用 `openai<3`：当前追踪适配基于 `httpx`，不兼容 OpenAI SDK 3.x 的 `httpx2`。已有环境更新后执行 `uv sync` 并重启后端，避免个人模型连接测试在请求发出前报客户端兼容错误。
 
-方式一（推荐）：仓库已包含 `.github/workflows/deploy.yml`。把整个仓库推送到 GitHub 的 `main` 分支，然后在仓库 Settings → Pages 中把 Source 设为 **GitHub Actions**，之后每次推送自动构建发布。
+初始化脚本在缺少 `backend/.env` 时从 `.env.example` 创建，生成两项独立的认证密钥；已有合法密钥会保留，且不会打印。随后用编辑器打开 `backend/.env`，确认以下配置：
 
-方式二（手动）：
+| 配置 | 本机开发填写方式 |
+| --- | --- |
+| `APP_ENV` | `development` |
+| `TURNSTILE_ENABLED` | `false`，仅实际回环请求可跳过人机验证 |
+| `DATABASE_URL` | 默认 `sqlite:///./data/mathcraft.db` |
+| `REDIS_URL` | 默认 `redis://127.0.0.1:6379/0`，与上一步的服务一致 |
+| `AUTH_JWT_SECRET`、`AUTH_CODE_SECRET` | 由初始化脚本生成，保留生成值 |
+| `DEEPSEEK_API_KEY` | 可填部署默认 Key，也可登录后在“个人中心 → API 配置”保存个人 Key |
+| `SMTP_*` | 使用邮箱验证码登录、找回密码或绑定邮箱时配置 |
 
-```bash
+上述复制命令仅在缺少 `app/local_secrets.py` 时创建占位配置，已有文件保留。首次账号密码登录无需真实模型凭据，使用模型功能前再配置对应服务。
+
+已有 `.env` 不会被模板覆盖，需手动核对开发开关。后端环境配置以 [backend/app/config.py](backend/app/config.py) 为准，进程环境变量优先于固定位置的 `backend/.env`；修改后需重启后端。唯一可复制的后端环境模板为 [backend/.env.example](backend/.env.example)，根 [.env.example](.env.example) 仅作配置入口指引，当前前后端均不读取根 `.env`。
+
+MinerU Token 在“个人中心 → API 配置”保存，个人配置优先；部署默认 Token 使用 `app/local_secrets.py` 的 `MINERU_DEFAULT_TOKEN`。旧 `MINERU_MODE`、`MINERU_API_BASE_URL`、`MINERU_API_TOKEN` 不生效，已有本机文件不会自动迁移。嵌入和重排模型仍由管理员“模型与检索”维护。
+
+平台生成模型凭据支持管理员接口 `/api/admin/llm-settings`，使用 `cryptography` 加密保存。调用优先使用个人 Key，其次为平台凭据，最后为部署默认；个人 Key 被模型服务拒绝时可回退平台配置。加密主密钥位于上传目录父级的 `secret.key`（默认 `backend/data/secret.key`），备份数据库时一并备份该文件。
+
+### 4. 迁移数据库并创建首个管理员
+
+已有数据应先备份并在副本验证；若曾使用旧 V2 同号迁移或来源不明，须先按[后端迁移说明](backend/README.md#迁移与验证)核对并制定修复方案。完成核验后继续在 `backend/` 执行：
+
+```powershell
+New-Item -ItemType Directory -Path data -Force | Out-Null
+uv run alembic upgrade head
+uv run python scripts/create_admin.py
+```
+
+按提示输入登录账号、显示名称和两次密码。账号可使用英文字母、数字、下划线、点和连字符；密码为 8–64 字符，UTF-8 不超过 72 字节，输入时隐藏。管理员只需首次创建，已有管理员时跳过最后一条命令；脚本不会覆盖已有账号。
+
+已有数据的环境应先备份再迁移。自定义 SQLite 路径时，先创建对应父目录；备份需包含 WAL 已提交数据，可使用 SQLite backup API，具体见 [后端说明](backend/README.md)。
+
+### 5. 启动后端
+
+仍在 `backend/` 执行，并保持该终端运行：
+
+```powershell
+$mathcraftTemp = (New-Item -ItemType Directory -Path data/tmp -Force).FullName
+$env:TEMP = $mathcraftTemp
+$env:TMP = $mathcraftTemp
+uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1 --no-proxy-headers
+```
+
+上述 PowerShell 启动方式为当前终端及后端子进程指定本地临时目录，避免 Windows 默认临时目录不可写时导致 Chroma 初始化或向量写入失败。Chroma 使用进程内本地持久存储，无需另外启动向量数据库服务；临时目录不替代 `CHROMA_DIR` 中的正式索引。
+
+启动后可访问：
+
+- 健康检查：`http://127.0.0.1:8000/api/health`
+- Swagger 接口文档：`http://127.0.0.1:8000/docs`
+
+索引重建使用进程内任务，当前按单进程部署，保留 `--workers 1`。
+
+### 6. 启动前端并登录
+
+新开一个终端，从仓库根目录执行：
+
+```powershell
 cd frontend
-npm run build
-npx gh-pages -d dist
+npm install
+node node_modules/vite/bin/vite.js --host 127.0.0.1 --port 5173 --strictPort
 ```
 
-`vite.config.ts` 中 `base: './'` 已配置相对路径，部署到仓库子路径（如 `user.github.io/riddleme/`）无需改动。
+打开 `http://127.0.0.1:5173`，使用刚创建的管理员账号选择“密码登录”。前端将 `/api` 和 `/media` 请求代理到后端的 8000 端口；端口占用时退出，不自动换端口。
 
-## 字体
+前端隔离项目环境文件，根 `.env` 和 `frontend/.env` 均不会被 Vite 加载；自定义公开 API 地址需在开发启动或构建前通过进程环境变量 `VITE_API_BASE_URL` 注入。监听地址与端口使用上述命令行参数，开发代理目标由 `frontend/vite.config.ts` 定义；`VITE_*` 会进入浏览器代码，不得放入凭据。详见[前端配置说明](frontend/README.md#构建与检查)。
 
-全局使用微软雅黑（Windows 自带），非 Windows 环境自动回退到苹方或系统无衬线字体。
+教师、学生账号由管理员开通。个人 DeepSeek Key 和 MinerU Token 在“个人中心 → API 配置”配置，未配置 DeepSeek Key 时智能出题不可发送；平台嵌入、重排模型由管理员在“模型与检索”配置。嵌入模型或服务地址变更后，需重建索引才能应用。
+
+部署默认的硅基流动与 MinerU 凭据配置方式见 [模型配置说明](docs/design/模型配置来源与普通知识库流程.md)，占位格式见 [local_secrets.example.py](backend/app/local_secrets.example.py)。
+
+### 7. 日常启动与停止
+
+首次初始化完成后，只需启动 Redis，并分别在 `backend/`、`frontend/` 运行上述服务命令。依赖变更后重新安装，数据库结构变更后重新执行迁移。
+
+前后端各在对应终端按 `Ctrl+C` 停止。Redis 在仓库根目录管理：
+
+```powershell
+docker compose stop redis       # 暂停
+docker compose up -d --wait redis # 恢复
+docker compose down             # 移除容器，保留数据卷
+```
+
+默认运行数据位于 `backend/data/`，包括 SQLite、上传原件、OCR 结果、头像与 Chroma 索引；Redis 数据另存在 Docker 卷中。日常停止不要给 `down` 添加 `-v`，该参数会删除数据卷。
+
+### 常见启动问题
+
+- 登录按钮显示“认证配置不可用”：确认认证密钥已初始化，开发配置为 `APP_ENV=development`、`TURNSTILE_ENABLED=false`，按上述回环地址与 `--no-proxy-headers` 启动，然后重启后端、刷新页面。检查启动环境变量是否覆盖 `.env`。
+- 前端请求失败：确认后端 8000 端口和 Redis 均已启动；邮件、向量、OCR 等依赖的状态可从健康检查查看。
+- Chroma 在 Windows 报 `code 14`：核对启动进程的 `TEMP/TMP` 是否可写，处理步骤见 [后端说明](backend/README.md)。
+- 删除资料提示 `DATABASE_BUSY` 或 `DELETION_PENDING`：短暂写锁会有限重试；已登记删除的资源进入不可用状态，重试或重启后继续清理，见 [删除与恢复边界](docs/design/数据一致性与故障恢复设计.md)。
+- 删除资料的全文索引清理出现 `SQLITE_CANTOPEN / 14`：更新后重启后端以应用 SQLite 内存临时存储配置；数据库与 WAL 仍保存在磁盘。该错误与写锁竞争分别处理，见 [后端排错说明](backend/README.md#常见问题)。
+
+生产部署需设置 `APP_ENV=production`、`TURNSTILE_ENABLED=true` 并配置 Cloudflare 站点信息，关闭开发账号能力，配置持久化路径与备份。服务器通过 SSH 连接，部署前按 [后端迁移说明](backend/README.md#迁移与验证) 完成备份、迁移与审计。
+
+### 可选 Phoenix
+
+默认关闭。需要时在 `backend/` 执行 `uv sync --extra phoenix`，在仓库根执行 `docker compose -f compose.phoenix.yaml up -d --wait phoenix`；设置 `PHOENIX_ENABLED=true` 并重启后端。使用根环境时也在根目录安装同名 extra。
+
+默认 OTLP 地址为 `http://127.0.0.1:6017/v1/traces`，查看入口为 `http://127.0.0.1:6017`。容器固定 Phoenix 21 镜像 digest，数据保存到 `phoenix_data` 命名卷。此本机部署默认无认证，仅限可信单机；远程访问须独立配置 HTTPS、认证和 API key。
+
+默认配置：`PHOENIX_ENABLED=false`、`PHOENIX_PROJECT=mathcraft`、`PHOENIX_API_KEY=`（`SecretStr`）、`PHOENIX_QUEUE_SIZE=128`、`PHOENIX_TIMEOUT_SECONDS=0.5`。根与后端 extra 均固定 `opentelemetry-sdk==1.45.2`、`opentelemetry-exporter-otlp-proto-http==1.45.2`，仅追踪元数据。停用时关闭开关并重启后端；容器可独立 `docker compose -f compose.phoenix.yaml stop phoenix`，保留数据卷。
+
+详细配置与排错见 [Phoenix 可选扩展](docs/design/Phoenix可选扩展.md)。
+
+## 开发检查
+
+后端在 `backend/` 执行；测试使用临时 SQLite、进程内 fakeredis 和外部服务替身，夹具禁止外部网络，不连接或清空本机 Redis：
+
+```powershell
+uv sync --group dev
+uv run pytest -q
+```
+
+开发依赖包含 `pytest-xdist`，可使用 `pytest -n 4 --dist loadfile` 并行执行。当前测试范围与隔离说明见[测试与持续集成](docs/测试与持续集成.md)。
+
+前端在 `frontend/` 执行：
+
+```powershell
+npm run typecheck
+npm run lint
+npm run build
+```
+
+## 文档入口
+
+- [后端说明](backend/README.md)、[前端说明](frontend/README.md)：开发、配置与排错。
+- [API 文档](docs/api.md)、[OpenAPI 契约](openapi.json)：接口与数据字段。
+- [数据一致性与故障恢复设计](docs/design/数据一致性与故障恢复设计.md)：关闭与历史作答、任务持久化、删除恢复及缓存完整性。
+- [账号与权限](docs/implementation/账号系统整合与审查修复.md)、[认证与账号安全](docs/implementation/登录视觉恢复与历史前端对照.md)。
+- [模型配置](docs/design/模型配置来源与普通知识库流程.md)、[知识库](docs/design/知识库模块说明.md)。
+- [四模式对话](docs/design/对话四模式与主线整合.md)、[出题审核](docs/design/出题审核中间件设计与实施记录.md)、[Word 导出](docs/design/题目Word导出与公式呈现.md)。
+- [出题链路优化设计](docs/design/出题质量与取材链路优化设计.md)、[需求讨论](docs/requirements/出题逻辑优化需求与设计讨论.md)、[本地问题核查](docs/research/出题与知识库问题核查-2026-11-15.md)：已确认范围、检查证据与待实现方案。
+- [运维后台](docs/design/运维后台模块说明.md)、[运行手册](docs/operations/运维后台运行手册.md)、[台账基础](docs/design/运维后台运行台账基础.md)、[入口接入](docs/design/运维后台出题入口接入.md)、[前端 V2](docs/implementation/运维后台前端V2适配与联调.md)和[可选追踪](docs/design/Phoenix可选扩展.md)。
+- [协作约定](AGENTS.md)。
+
+## 许可证
+
+本项目采用 [Apache License 2.0](LICENSE) 开源。第三方组件的许可证与声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
