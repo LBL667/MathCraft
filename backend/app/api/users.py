@@ -1,5 +1,7 @@
 """个人资料、头像与按用户模型配置接口。"""
-from fastapi import APIRouter, Depends, UploadFile
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, Depends, Request, Response, UploadFile
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -8,16 +10,25 @@ from app.db import get_db
 from app.deps import get_current_user
 from app.errors import AppError
 from app.models import User
-from app.schemas.auth import ModelSettingsBody
-from app.schemas.user import UserUpdateBody
-from app.services.model_settings import get_effective_mineru_token, get_setting, mask, user_payload
+from app.schemas.auth import (
+    CurrentPasswordBody, EmailBindingBody, EmailChangeBody, EmailCommitBody,
+    ModelSettingsBody, ModelTestBody, UserNoBody,
+)
+from app.api.auth_http import clear_refresh, refresh_belongs_to_user
+from app.models import EmailChange
+from app.models.base import new_id
+from app.services import auth as auth_service
+from app.services import auth_codes
+from app.schemas.user import EmailChangeResult, UserPayload, UserUpdateBody
+from app.services.model_settings import (
+    get_effective_mineru_token, get_setting, mask, require_deepseek_key, user_payload,
+)
+from app.services.rag_runtime import current_snapshot
 
 router = APIRouter(prefix="/api/users/me", tags=["users"])
 
-# 硅基流动 / 向量 / 重排为系统内置，不提供配置入口（v2 文档 8.1）
+# 普通用户仅查看系统模型状态，编辑入口归平台管理员。
 SYSTEM_BUILTIN = {
-    "embedding_model": "BAAI/bge-m3",
-    "rerank_model": "BAAI/bge-reranker-v2-m3",
     "embedding_configurable": False,
     "rerank_configurable": False,
 }
@@ -30,21 +41,20 @@ AVATAR_TYPES = {
 }
 
 
-@router.put("")
+@router.put("", response_model=UserPayload)
 def update_profile(
     body: UserUpdateBody,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """修改昵称、性别、手机号、邮箱、学校。"""
+    """普通资料不得修改认证标识；写入前再次校验版本。"""
+    auth_service.assert_version(db, user.id, user.auth_version)
     if body.display_name is not None:
         user.display_name = body.display_name.strip()
-    if body.gender is not None:
+    if "gender" in body.model_fields_set:
         user.gender = body.gender
-    if body.phone is not None:
+    if "phone" in body.model_fields_set:
         user.phone = body.phone
-    if body.email is not None:
-        user.email = body.email.strip()
     if body.school is not None:
         user.school = body.school.strip()
     try:
@@ -66,10 +76,11 @@ async def upload_avatar(
     ext = AVATAR_TYPES.get((file.content_type or "").lower())
     if ext is None:
         raise AppError("UNSUPPORTED_FORMAT", "仅支持 PNG / JPG / WebP 图片", status_code=400)
-    content = await file.read()
+    limit = settings.max_avatar_mb * 1024 * 1024
+    content = await file.read(limit + 1)
     if not content:
         raise AppError("EMPTY_FILE", "文件内容为空", status_code=400)
-    if len(content) > settings.max_avatar_mb * 1024 * 1024:
+    if len(content) > limit:
         raise AppError("DOCUMENT_TOO_LARGE", f"头像不能超过 {settings.max_avatar_mb} MB", status_code=422)
 
     dest = settings.avatar_path() / f"{user.id}{ext}"
@@ -81,7 +92,9 @@ async def upload_avatar(
 
 @router.get("/model-settings")
 def read_model_settings(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """读取脱敏配置；mineru_using_default 仅在无个人 Token 且默认 Token 存在时为真。"""
     row = get_setting(db, user.id)
+    runtime = current_snapshot().config
     return {
         "deepseek_model": settings.deepseek_display_name,
         "deepseek_model_id": settings.deepseek_model,
@@ -89,9 +102,11 @@ def read_model_settings(user: User = Depends(get_current_user), db: Session = De
         "deepseek_key_masked": mask(row.deepseek_api_key),
         "mineru_token_configured": bool(row.mineru_token),
         "mineru_token_masked": mask(row.mineru_token),
-        "mineru_using_default": not row.mineru_token,
+        "mineru_using_default": not row.mineru_token and bool(get_effective_mineru_token(db, user.id)),
         "mineru_limits": MINERU_LIMITS,
         **SYSTEM_BUILTIN,
+        "embedding_model": runtime.embedding_model,
+        "rerank_model": runtime.rerank_model,
     }
 
 
@@ -101,6 +116,7 @@ def save_model_settings(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    auth_service.assert_version(db, user.id, user.auth_version)
     row = get_setting(db, user.id)
     if body.deepseek_api_key is not None:
         row.deepseek_api_key = body.deepseek_api_key.strip() or None
@@ -111,13 +127,17 @@ def save_model_settings(
 
 
 @router.post("/model-settings/test-deepseek")
-def test_deepseek(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def test_deepseek(
+    body: ModelTestBody | None = None,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """测试 DeepSeek 连接；body 提供输入值时优先测试该值，不落库。失败仅返回固定脱敏提示。"""
     from app.services.rag import llm
 
-    row = get_setting(db, user.id)
-    key = row.deepseek_api_key or settings.deepseek_api_key
-    if not key:
-        raise AppError("DEEPSEEK_KEY_MISSING", "请先填写 DeepSeek API Key", status_code=400)
+    provided = (body.deepseek_api_key or "").strip() if body else ""
+    key = provided or require_deepseek_key(db, user.id)
+    db.rollback()
     try:
         reply = llm.chat_text(
             [{"role": "user", "content": "ping"}],
@@ -126,18 +146,136 @@ def test_deepseek(user: User = Depends(get_current_user), db: Session = Depends(
             max_tokens=8,
         )
     except Exception as exc:
-        raise AppError("LLM_ERROR", f"DeepSeek 连接失败：{exc}", status_code=400) from exc
+        raise AppError("LLM_ERROR", llm.friendly_error(exc), status_code=400) from None
     return {"ok": True, "model": settings.deepseek_display_name, "reply": (reply or "")[:32]}
 
 
-@router.post("/model-settings/test-mineru")
-def test_mineru(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+@router.post("/model-settings/test-mineru", summary="测试 MinerU 连接与鉴权（不验证文件解析）")
+def test_mineru(
+    body: ModelTestBody | None = None,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """只读验证 MinerU 配置的连接与鉴权；body 提供输入值时优先测试该值，不落库。
+
+    严格校验 HTTP、JSON 与业务状态，仅将明确成功或官方找不到探测任务视为通过。
+    """
     from app.services import mineru
 
-    token = get_effective_mineru_token(db, user.id)
+    provided = (body.mineru_token or "").strip() if body else ""
+    token = provided or get_effective_mineru_token(db, user.id)
     if not token:
         raise AppError("MINERU_TOKEN_MISSING", "请先填写 MinerU Token", status_code=400)
     ok, detail = mineru.ping_token(token)
     if not ok:
-        raise AppError("LLM_ERROR", f"MinerU Token 无效：{detail}", status_code=400)
+        raise AppError("LLM_ERROR", f"MinerU 连接测试失败：{detail}", status_code=400)
     return {"ok": True, "limits": MINERU_LIMITS}
+
+
+@router.put("/email-binding", status_code=204, response_model=None)
+def bind_email(body: EmailBindingBody, request: Request, response: Response,
+               user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """有效登录态及新邮箱 proof 校验后，在同一事务绑定邮箱并撤销全部会话。"""
+    version = user.auth_version
+    auth_service.require_email_binding(user)
+    auth_service.assert_version(db, user.id, version)
+    clear_cookie = refresh_belongs_to_user(request, db, user.id)
+    auth_codes.verify(db, body.email, "email_bind", auth_service.email_binding(user, body.email),
+                      body.challenge_id, body.code)
+    auth_service.revoke_all(db, user, version)
+    user.email = body.email
+    user.email_normalized = body.email
+    user.email_verified = True
+    user.email_verified_at = datetime.now(timezone.utc)
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise AppError("EMAIL_IN_USE", "邮箱已被使用", 409) from exc
+    response.headers["Cache-Control"] = "no-store"
+    if clear_cookie:
+        clear_refresh(response)
+
+
+@router.delete("/email", status_code=204, response_model=None)
+def unbind_email(body: CurrentPasswordBody, request: Request, response: Response,
+                 user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """校验当前密码后清空邮箱及验证标记，并原子撤销全部会话。"""
+    version = user.auth_version
+    if not auth_service.verify_password(body.current_password, user.password_hash):
+        raise AppError("AUTH_FAILED", "当前密码不正确", 400)
+    clear_cookie = refresh_belongs_to_user(request, db, user.id)
+    auth_service.revoke_all(db, user, version)
+    user.email = None
+    user.email_normalized = None
+    user.email_verified = False
+    user.email_verified_at = None
+    db.commit()
+    response.headers["Cache-Control"] = "no-store"
+    if clear_cookie:
+        clear_refresh(response)
+
+
+@router.post("/email-change", status_code=201, response_model=EmailChangeResult)
+def start_email_change(body: EmailChangeBody, user: User = Depends(get_current_user),
+                       db: Session = Depends(get_db)):
+    """建立十分钟双邮箱快照；后续发码由事务确定真实收件人。"""
+    auth_service.assert_version(db, user.id, user.auth_version)
+    if not auth_service.has_verified_email(user):
+        raise AppError("AUTH_FAILED", "当前邮箱尚未完成验证", 400)
+    if body.new_email == user.email_normalized:
+        raise AppError("VALIDATION_ERROR", "新邮箱不能与当前邮箱相同", 400)
+    if db.query(User).filter_by(email_normalized=body.new_email).first():
+        raise AppError("EMAIL_IN_USE", "邮箱已被使用", 409)
+    auth_service.cleanup_expired_records(db)
+    change = EmailChange(id=new_id("ec"), user_id=user.id, old_email=user.email_normalized,
+        new_email=body.new_email, auth_version=user.auth_version,
+        expires_at=auth_service.now() + 600)
+    db.add(change)
+    db.commit()
+    return {"change_id": change.id, "expires_in": 600}
+
+
+@router.put("/email", status_code=204, response_model=None)
+def commit_email_change(body: EmailCommitBody, request: Request, response: Response,
+                        user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """双 proof、版本、邮箱写入和全部会话撤销位于同一事务。"""
+    change = auth_service.get_change(db, user, body.change_id)
+    version = user.auth_version
+    auth_service.assert_version(db, user.id, version)
+    clear_cookie = refresh_belongs_to_user(request, db, user.id)
+    auth_codes.verify(db, change.old_email, "email_change_old",
+        auth_service.change_binding(change, "email_change_old"), body.old_challenge_id, body.old_code)
+    auth_codes.verify(db, change.new_email, "email_change_new",
+        auth_service.change_binding(change, "email_change_new"), body.new_challenge_id, body.new_code)
+    auth_service.revoke_all(db, user, version)
+    user.email = change.new_email
+    user.email_normalized = change.new_email
+    user.email_verified = True
+    user.email_verified_at = datetime.now(timezone.utc)
+    change.status = "completed"
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise AppError("EMAIL_IN_USE", "邮箱已被使用", 409) from exc
+    response.headers["Cache-Control"] = "no-store"
+    if clear_cookie:
+        clear_refresh(response)
+
+
+@router.put("/user-no", response_model=UserPayload)
+def change_user_no(body: UserNoBody, user: User = Depends(get_current_user),
+                   db: Session = Depends(get_db)):
+    """学工号增改删验证当前密码和原认证版本，保留用户身份归属。"""
+    version = user.auth_version
+    if not auth_service.verify_password(body.current_password, user.password_hash):
+        raise AppError("AUTH_FAILED", "当前密码不正确", 400)
+    auth_service.assert_version(db, user.id, version)
+    user.user_no = body.user_no
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise AppError("USER_NO_IN_USE", "学工号已被使用", 409) from exc
+    return user_payload(user)

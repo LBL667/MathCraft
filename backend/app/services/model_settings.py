@@ -2,27 +2,31 @@
 from sqlalchemy.orm import Session
 
 from app import local_secrets
-from app.config import settings
 from app.errors import AppError
 from app.models import User, UserModelSetting
+from app.services.auth import has_verified_email
+from app.services.rag.llm import LlmRuntime, ResolvedApiKey, resolve_llm_runtime
 
 
 def get_setting(db: Session, user_id: str) -> UserModelSetting:
+    """在调用者事务内获取或创建设置，不释放认证版本锁。"""
     row = db.get(UserModelSetting, user_id)
     if row is None:
         row = UserModelSetting(user_id=user_id)
         db.add(row)
-        db.commit()
-        db.refresh(row)
+        db.flush()
     return row
 
 
-def get_effective_deepseek_key(db: Session, user_id: str) -> str:
-    """用户配置优先；环境变量仅作脚本与调试兜底。"""
+def get_effective_llm_runtime(db: Session, user_id: str) -> LlmRuntime:
+    """读取个人配置并一次解析完整运行快照，不提交或释放调用者事务。"""
     row = db.get(UserModelSetting, user_id)
-    if row and row.deepseek_api_key:
-        return row.deepseek_api_key
-    return settings.deepseek_api_key
+    return resolve_llm_runtime(row.deepseek_api_key if row else None)
+
+
+def get_effective_deepseek_key(db: Session, user_id: str) -> str:
+    """兼容旧调用链的字符串参数，完整凭据及来源仅附于内存对象。"""
+    return ResolvedApiKey(get_effective_llm_runtime(db, user_id))
 
 
 def get_effective_mineru_token(db: Session, user_id: str) -> str:
@@ -37,7 +41,7 @@ def require_deepseek_key(db: Session, user_id: str) -> str:
     if not key:
         raise AppError(
             "DEEPSEEK_KEY_MISSING",
-            "尚未配置 DeepSeek API Key，请到个人中心 → 模型配置中填写",
+            "尚未配置 DeepSeek API Key，请到个人中心 → API 配置中填写",
             status_code=400,
         )
     return key
@@ -56,12 +60,14 @@ def user_payload(user: User) -> dict:
         "id": user.id,
         "account": user.account,
         "role": user.role,
-        "identity": user.identity,
+        "identity": {"teacher": "教师", "student": "学生", "admin": "管理员"}[user.role],
         "display_name": user.display_name,
         "gender": user.gender,
         "phone": user.phone,
         "email": user.email,
+        "email_verified": has_verified_email(user),
         "user_no": user.user_no,
         "school": user.school,
         "avatar_url": user.avatar_url,
+        "password_change_recommended": getattr(user, "password_change_recommended", False),
     }

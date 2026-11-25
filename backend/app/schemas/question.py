@@ -1,7 +1,51 @@
 """领域模型：与前端 frontend/src/types/index.ts 的 Question 结构严格对齐。"""
+import re
 from enum import Enum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+from app.services.latex_utils import fix_delimiters
+
+# 选项文本里常见的「A. xxx」前缀
+_OPTION_PREFIX = re.compile(r"^([A-Ha-h])[.、．:：]\s*(.+)$")
+
+
+def _as_dict(value) -> dict:
+    """模型有时把蓝图、自检写成一段话，统一收成字典，避免整题被判为非法。"""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        return {"note": value.strip()} if value.strip() else {}
+    if isinstance(value, list):
+        return {"items": value}
+    return {}
+
+
+def _as_str_list(value) -> list[str]:
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if str(v).strip()]
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if isinstance(value, dict):
+        return [f"{k}：{v}" for k, v in value.items()]
+    return []
+
+
+# 渲染层只解析美元定界符；模型偶发输出 \( \) 与 \[ \]，入库前统一改写
+_INLINE_MATH = re.compile(r"\\\((.+?)\\\)", re.S)
+_DISPLAY_MATH = re.compile(r"\\\[(.+?)\\\]", re.S)
+_CODE_FENCE = re.compile(r"```(?:latex|tex|math)?\s*|\s*```")
+
+
+def normalize_latex(text: str) -> str:
+    """把其他 LaTeX 定界符统一成 $...$ / $$...$$，并剥掉 markdown 代码栅栏。"""
+    if not text:
+        return text
+    if "```" in text:
+        text = _CODE_FENCE.sub("", text)
+    text = _DISPLAY_MATH.sub(lambda m: "$$" + m.group(1) + "$$", text)
+    text = _INLINE_MATH.sub(lambda m: "$" + m.group(1) + "$", text)
+    return fix_delimiters(text)
 
 
 class QuestionType(str, Enum):
@@ -33,16 +77,63 @@ class Question(BaseModel):
     # 题干/选项/答案/解析中的公式一律用 $...$ 包裹的 LaTeX
     stem: str
     options: list[OptionItem] = []
-    answer: str
-    analysis: str
+    # 出题模型只命制题干：answer/analysis 由解题模型填充，中途态允许为空
+    answer: str = ""
+    analysis: str = ""
     knowledgePoint: str = ""
+    # 命题阶段写下的蓝图、评分点与自检结果，用于审计与展示
+    blueprint: dict = {}
+    scoringPoints: list[str] = []
+    selfCheck: dict = {}
+    # 中间件盲评得到的加权总分（1~5），0 表示未评估
+    difficultyScore: float = 0.0
+    # 盲评明细：各维分、判定档、缺陷码与建议
+    difficultyReview: dict = {}
     starred: bool = False
     docName: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce(cls, data):
+        """兼容模型输出的常见偏差：蓝图/自检写成字符串、选项写成字符串数组、定界符不统一。"""
+        if not isinstance(data, dict):
+            return data
+        out = dict(data)
+        for key in ("stem", "answer", "analysis"):
+            if isinstance(out.get(key), str):
+                out[key] = normalize_latex(out[key])
+        for key in ("blueprint", "selfCheck", "difficultyReview"):
+            if key in out:
+                out[key] = _as_dict(out[key])
+        if "scoringPoints" in out:
+            out["scoringPoints"] = _as_str_list(out["scoringPoints"])
+        options = out.get("options")
+        if isinstance(options, list):
+            fixed = []
+            for index, item in enumerate(options):
+                if isinstance(item, str):
+                    label = "ABCDEFGH"[index] if index < 8 else str(index + 1)
+                    text = normalize_latex(item.strip())
+                    matched = _OPTION_PREFIX.match(text)
+                    if matched:
+                        label, text = matched.group(1).upper(), matched.group(2).strip()
+                    fixed.append({"label": label, "text": text})
+                elif isinstance(item, dict) and isinstance(item.get("text"), str):
+                    fixed.append({**item, "text": normalize_latex(item["text"])})
+                elif isinstance(item, OptionItem):
+                    fixed.append({"label": item.label, "text": normalize_latex(item.text)})
+                else:
+                    fixed.append(item)
+            out["options"] = fixed
+        return out
 
 
 class TypeCount(BaseModel):
     type: QuestionType
-    count: int = Field(ge=1, le=20)
+    # 高压长任务：单题型上限放宽到 100，由规划层拆批执行
+    count: int = Field(ge=1, le=100)
+    # 题型级难度；None 时回退全局 params.difficulty
+    difficulty: Difficulty | None = None
 
 
 class GenerateParams(BaseModel):

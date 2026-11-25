@@ -12,18 +12,33 @@ dependencies = [
     "alembic>=1.13",
     "redis>=5.0",
     "bcrypt>=4.2",
+    "PyJWT>=2.10,<3",
     "jieba>=0.42",
     "chromadb>=0.5.20",
     "pymupdf>=1.24.0",
     "python-docx>=1.1.2",
     "openpyxl>=3.1.5",
-    "openai>=1.55.0",
+    "openai>=1.55.0,<3",
     "httpx>=0.27.0",
+    "latex2mathml>=3.81.1",
+    "mathml2omml>=0.0.2",
+    "json-repair>=0.64.9",
+    "cryptography>=50.0.2",
+]
+
+[project.optional-dependencies]
+phoenix = [
+    "opentelemetry-sdk==1.45.2",
+    "opentelemetry-exporter-otlp-proto-http==1.45.2",
 ]
 
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-xdist>=3.8,<4",
+    "ruff>=0.15.22,<0.16",
+    "fakeredis[lua]>=2.28,<3",
 ]
 
 [tool.uv]

@@ -5,32 +5,28 @@ from fastapi import APIRouter, BackgroundTasks, Depends, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
-from app.config import BASE_DIR, settings
+from app.config import BASE_DIR
 from app.db import get_db
 from app.deps import (
     BankAccess,
+    DeletionAccess,
     get_bank_access,
     require_bank_admin,
-    require_bank_super_admin,
+    require_document_deletion_admin,
 )
 from app.errors import AppError
-from app.models import Document, User
-from app.models.base import new_id
-from app.schemas.bank import SearchBody
+from app.models import Document
+from app.schemas.auth import ErrorResponse
+from app.schemas.bank import DocumentResponse, SearchBody
 from app.services import banks as bank_service
 from app.services import documents as doc_service
-from app.services.model_settings import get_effective_mineru_token
+from app.services.model_settings import get_effective_deepseek_key, get_effective_mineru_token
+from app.services.rag import embeddings, vectorstore
+from app.services.rag_runtime import with_snapshot
 
 router = APIRouter(prefix="/api/banks/{bank_id}", tags=["documents"])
 
-FORMATS = {
-    ".pdf": "PDF",
-    ".docx": "DOCX",
-    ".xlsx": "XLSX",
-    ".md": "MD",
-    ".markdown": "MD",
-    ".txt": "TXT",
-}
+FORMATS = doc_service.UPLOAD_FORMATS
 
 
 def _doc_payload(doc: Document) -> dict:
@@ -59,7 +55,7 @@ def _get_document(bank_id: str, document_id: str, db: Session) -> Document:
     return doc
 
 
-@router.get("/documents")
+@router.get("/documents", response_model=list[DocumentResponse])
 def list_documents(
     access: BankAccess = Depends(get_bank_access),
     db: Session = Depends(get_db),
@@ -70,54 +66,28 @@ def list_documents(
         .order_by(Document.created_at.desc())
         .all()
     )
-    return [_doc_payload(d) for d in docs]
+    return [_doc_payload(d) for d in docs] + bank_service.pending_document_payloads(
+        db, access.bank.id,
+    )
 
 
 @router.post("/documents", status_code=202)
-async def upload_document(
+def upload_document(
     background: BackgroundTasks,
     file: UploadFile,
     access: BankAccess = Depends(require_bank_admin),
     db: Session = Depends(get_db),
 ):
     """上传文档：保存文件后立即返回，解析/OCR/切片/向量化在后台进行。"""
-    suffix = Path(file.filename or "").suffix.lower()
-    if suffix not in FORMATS:
-        raise AppError("UNSUPPORTED_FORMAT", f"不支持的文件格式 {suffix}，目前支持 PDF/DOCX/XLSX/MD/TXT", status_code=400)
-    content = await file.read()
-    if len(content) > settings.max_upload_mb * 1024 * 1024:
-        raise AppError("DOCUMENT_TOO_LARGE", f"文件超过 {settings.max_upload_mb} MB 上限", status_code=422)
-    if not content:
-        raise AppError("EMPTY_FILE", "文件内容为空", status_code=400)
-
-    doc_id = new_id("doc")
-    store_dir = settings.upload_path() / access.bank.id
-    store_dir.mkdir(parents=True, exist_ok=True)
-    store_path = store_dir / f"{doc_id}{suffix}"
-    store_path.write_bytes(content)
-    # 存路径：位于 backend 目录内时存相对路径，否则存绝对路径（便于整体迁移与自定义目录）
-    try:
-        rel_path = store_path.relative_to(BASE_DIR).as_posix()
-    except ValueError:
-        rel_path = store_path.as_posix()
-
-    doc = Document(
-        id=doc_id,
-        bank_id=access.bank.id,
-        name=file.filename or f"{doc_id}{suffix}",
-        format=FORMATS[suffix],
-        size_bytes=len(content),
-        storage_path=rel_path,
-        status="uploaded",
-        stage="已上传，等待解析",
-        uploader_id=access.member.user_id,
+    content = file.file.read()
+    result = doc_service.queue_upload(
+        db, background, access.bank.id, access.member.user_id,
+        file.filename or "", content,
+        get_effective_mineru_token(db, access.member.user_id),
+        deepseek_api_key=get_effective_deepseek_key(db, access.member.user_id),
+        actor=access.user,
     )
-    db.add(doc)
-    db.commit()
-
-    mineru_token = get_effective_mineru_token(db, access.member.user_id)
-    background.add_task(doc_service.run_ingestion, doc_id, mineru_token)
-    return {"document_id": doc_id, "status": doc.status, "stage": doc.stage, "progress": 0}
+    return result
 
 
 @router.get("/documents/{document_id}")
@@ -138,50 +108,108 @@ def reprocess_document(
     db: Session = Depends(get_db),
 ):
     doc = _get_document(access.bank.id, document_id, db)
-    if doc.status not in ("failed", "ready"):
-        raise AppError("BAD_STATE", "仅失败或已完成的文档可重新解析", status_code=400)
-    doc.status = "uploaded"
-    doc.stage = "已重新排队，等待解析"
-    doc.error_message = None
-    db.commit()
+    doc_service.requeue_document(db, doc, actor=access.user)
     mineru_token = get_effective_mineru_token(db, access.member.user_id)
-    background.add_task(doc_service.run_ingestion, doc.id, mineru_token)
+    deepseek_api_key = get_effective_deepseek_key(db, access.member.user_id)
+    background.add_task(
+        doc_service.run_ingestion, doc.id, mineru_token, deepseek_api_key=deepseek_api_key,
+    )
     return {"document_id": doc.id, "status": doc.status, "stage": doc.stage, "progress": 0}
 
 
-@router.get("/documents/{document_id}/download")
+@router.get(
+    "/documents/{document_id}/download",
+    response_class=FileResponse,
+    responses={
+        200: {
+            "description": "当前 storage_path 指向的文件；inline 参数决定内联展示或附件下载",
+            "headers": {
+                "Content-Disposition": {
+                    "description": "inline 或 attachment，附带 filename 或 filename* 文件名",
+                    "schema": {"type": "string"},
+                },
+            },
+            "content": {
+                media: {"schema": {"type": "string", "format": "binary"}}
+                for media in (
+                    "application/pdf", "text/plain",
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    "application/octet-stream",
+                )
+            },
+        },
+        401: {"model": ErrorResponse, "description": "未登录或凭据已失效"},
+        403: {"model": ErrorResponse, "description": "当前账号无教学资源访问权限"},
+        404: {"model": ErrorResponse, "description": "题库、文档或当前文件不存在或不可访问"},
+        503: {"model": ErrorResponse, "description": "依赖服务暂不可用"},
+    },
+)
 def download_document(
     document_id: str,
-    access: BankAccess = Depends(require_bank_admin),
+    inline: bool = False,
+    access: BankAccess = Depends(get_bank_access),
     db: Session = Depends(get_db),
 ):
+    """下载当前 storage_path 指向的产物；inline=1 供浏览器直接查看。"""
     doc = _get_document(access.bank.id, document_id, db)
+    if doc.status == "deleting":
+        raise AppError("DOCUMENT_NOT_FOUND", "文档正在删除，不可下载", status_code=404)
     p = Path(doc.storage_path)
     if not p.is_absolute():
         p = BASE_DIR / p
     if not p.exists():
         raise AppError("DOCUMENT_NOT_FOUND", "源文件已不存在", status_code=404)
-    return FileResponse(p, filename=doc.name)
+    media_types = {
+        "PDF": "application/pdf",
+        "MD": "text/plain; charset=utf-8",
+        "TXT": "text/plain; charset=utf-8",
+        "DOCX": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "XLSX": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    }
+    return FileResponse(
+        p, filename=doc.name, media_type=media_types.get(doc.format, "application/octet-stream"),
+        content_disposition_type="inline" if inline else "attachment",
+    )
 
 
-@router.delete("/documents/{document_id}", status_code=204)
+@router.delete("/documents/{document_id}", status_code=204, responses={
+    503: {
+        "model": ErrorResponse,
+        "description": "删除未完成；资源保持不可用并保留恢复记录与待清理原件，可重试删除",
+    },
+})
 def delete_document(
     document_id: str,
-    access: BankAccess = Depends(require_bank_super_admin),
+    access: DeletionAccess = Depends(require_document_deletion_admin),
     db: Session = Depends(get_db),
 ):
-    doc = _get_document(access.bank.id, document_id, db)
-    bank_service.purge_document(db, doc)
+    try:
+        bank_service.purge_document_by_id(db, access.bank.id, document_id, actor=access.user)
+    except vectorstore.VectorStoreError as exc:
+        raise AppError("VECTOR_STORE_UNAVAILABLE", str(exc), status_code=503) from exc
     return None
 
 
-@router.post("/search")
+@router.post("/search", responses={
+    503: {"model": ErrorResponse, "description": "向量存储或嵌入服务暂不可用"},
+})
+@with_snapshot
 def search_bank(
     body: SearchBody,
     access: BankAccess = Depends(get_bank_access),
 ):
-    """检索测试：mode=dense/sparse/hybrid/hybrid_rerank，默认完整链路。"""
-    from app.services.rag import fts, retrieval, vectorstore
+    """仅检索 ready 文档；hybrid 只融合不重排，默认 hybrid_rerank 执行重排。"""
+    try:
+        return _search_bank(body, access)
+    except vectorstore.VectorStoreError as exc:
+        raise AppError("VECTOR_STORE_UNAVAILABLE", str(exc), status_code=503) from exc
+    except embeddings.EmbeddingError as exc:
+        raise AppError("EMBEDDING_UNAVAILABLE", str(exc), status_code=503) from exc
+
+
+def _search_bank(body: SearchBody, access: BankAccess) -> dict:
+    from app.services.rag import fts, retrieval
     from app.services.rag import embeddings
 
     if body.mode in ("hybrid", "hybrid_rerank"):
@@ -190,16 +218,17 @@ def search_bank(
             body.query,
             document_id=body.document_id,
             rerank_top_k=body.top_k if body.mode == "hybrid_rerank" else None,
+            skip_rerank=body.mode == "hybrid",
         )
-        if body.mode == "hybrid":
-            result["reranked"] = []
         # 精简 dense 字段
         result["dense"] = [{k: h[k] for k in ("chunk_id", "doc_name", "chunk_index", "distance")} | {"text": h["text"]} for h in result["dense"]]
         return result
 
     if body.mode == "dense":
         vec = embeddings.embed_one(body.query)
-        hits = vectorstore.search(access.bank.id, vec, top_k=body.top_k, doc_id=body.document_id)
+        hits = retrieval.dense_search(
+            access.bank.id, vec, top_k=body.top_k, document_id=body.document_id,
+        )
         return {"mode": "dense", "results": hits}
 
     # sparse

@@ -1,25 +1,25 @@
 """学习空间业务：编号、列表载荷、成员操作、解散。"""
-from datetime import datetime, timezone
+import secrets
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.deps import SpaceAccess
+from app.deps import SpaceAccess, lock_resource
 from app.errors import AppError
 from app.models import SpaceMember, StudySpace, User
 from app.models.base import new_id
+from app.services.auth import assert_version
+
+
+CODE_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 
 def generate_space_code(db: Session) -> str:
-    year = datetime.now(timezone.utc).year
-    prefix = f"SP{year}"
-    base = db.query(func.count(StudySpace.id)).filter(StudySpace.code.like(f"{prefix}%")).scalar() or 0
-    seq = base + 1
+    """生成 10 位随机编号（SP 前缀 + 8 位随机字符），编号同时作为邀请凭据。"""
     while True:
-        code = f"{prefix}{seq:04d}"
+        code = "SP" + "".join(secrets.choice(CODE_ALPHABET) for _ in range(8))
         if not db.query(StudySpace.id).filter(StudySpace.code == code).first():
             return code
-        seq += 1
 
 
 def member_count(db: Session, space_id: str) -> int:
@@ -54,12 +54,14 @@ def space_payload(db: Session, space: StudySpace, user: User) -> dict:
         )
         .one_or_none()
     )
+    if member is None:
+        raise AppError("SPACE_NOT_FOUND", "学习空间不存在或你不是该空间成员", 404)
     creator = db.get(User, space.creator_id)
     access = SpaceAccess(
         space=space,
         member=member,
         user=user,
-        my_role=member.role if member else "member",
+        my_role=member.role,
     )
     member_rows = (
         db.query(SpaceMember, User)
@@ -121,6 +123,40 @@ def create_space(db: Session, user: User, name: str, capacity: int) -> StudySpac
     db.add(SpaceMember(id=new_id("sm"), space_id=space.id, user_id=user.id, role="creator", status="active"))
     db.commit()
     db.refresh(space)
+    return space
+
+
+def join_space(db: Session, user: User, code: str) -> StudySpace:
+    """在空间写锁内重读账号与容量，并原子提交成员关系。"""
+    actor_id, version = user.id, user.auth_version
+    space = db.query(StudySpace).filter_by(code=code, status="active").one_or_none()
+    if space is None:
+        raise AppError("SPACE_CODE_NOT_FOUND", "未找到该编号的学习空间", 404)
+    space_id = space.id
+    lock_resource(db, StudySpace, space_id)
+    assert_version(db, actor_id, version)
+    current_user = db.get(User, actor_id, populate_existing=True)
+    if current_user is None or current_user.role != "student":
+        raise AppError("FORBIDDEN", "该操作仅学生可用", 403)
+    space = db.get(StudySpace, space_id, populate_existing=True)
+    if space is None or space.status != "active" or space.code != code:
+        raise AppError("SPACE_CODE_NOT_FOUND", "未找到该编号的学习空间", 404)
+    existing = db.query(SpaceMember).filter_by(
+        space_id=space_id, user_id=actor_id,
+    ).populate_existing().one_or_none()
+    if existing is not None and existing.status == "removed":
+        raise AppError("SPACE_JOIN_FORBIDDEN", "已被移出该空间，请联系创建者", 403)
+    if existing is not None and existing.status == "active":
+        raise AppError("ALREADY_IN_SPACE", "你已在该学习空间中", 409)
+    if member_count(db, space_id) >= space.capacity:
+        raise AppError("SPACE_FULL", "该学习空间人数已满", 409)
+    if existing is None:
+        db.add(SpaceMember(id=new_id("sm"), space_id=space_id, user_id=actor_id,
+                           role="member", status="active"))
+    else:
+        existing.status = "active"
+        existing.role = "member"
+    db.commit()
     return space
 
 
